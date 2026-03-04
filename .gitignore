@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtualenv
+venv/
+.venv/
+
+# Local secrets / env
+.env
+.env.*
+
+# Logs / outputs
+logs/
+*.log
+*.jsonl
+*.csv
+
+# Local archives / build artifacts
+*.zip
+.DS_Store
