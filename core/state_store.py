@@ -1,15 +1,4 @@
-"""StateStore - Durable bot state for crash-safe operation.
-
-Live trading bots must survive restarts without "forgetting" open orders,
-positions, or reserved/unsettled cash. This module persists a minimal,
-auditable snapshot to disk.
-
-Design goals:
-  - Small, human-readable JSON.
-  - Atomic writes (write temp + replace).
-  - Forward-compatible via schema_version.
-  - No broker secrets.
-"""
+"""StateStore - Durable bot state for crash-safe operation."""
 from __future__ import annotations
 
 import json
@@ -17,7 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 def _json_default(obj):
     if isinstance(obj, Decimal):
@@ -37,7 +26,7 @@ class EngineSnapshot:
     cash_ledger: Dict[str, Any]
 
 class StateStore:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: Union[str, Path]):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
