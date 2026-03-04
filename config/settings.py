@@ -1,0 +1,226 @@
+"""Trading Bot V1.0 - Configuration & Constants"""
+from dataclasses import dataclass, field
+from decimal import Decimal
+from enum import Enum, auto
+import os
+
+
+class AccountType(Enum):
+    CASH = auto()
+    MARGIN = auto()
+
+
+class Environment(Enum):
+    PAPER = auto()
+    LIVE = auto()
+
+
+class OrderState(Enum):
+    PENDING_NEW = auto()
+    SENT = auto()
+    ACCEPTED = auto()
+    PARTIALLY_FILLED = auto()
+    FILLED = auto()
+    PENDING_CANCEL = auto()
+    CANCELED = auto()
+    REJECTED = auto()
+    EXPIRED = auto()
+    ERROR = auto()
+
+    @property
+    def is_terminal(self):
+        return self in (
+            OrderState.FILLED, OrderState.CANCELED,
+            OrderState.REJECTED, OrderState.EXPIRED, OrderState.ERROR
+        )
+
+    @property
+    def is_active(self):
+        return not self.is_terminal
+
+
+VALID_ORDER_TRANSITIONS = {
+    OrderState.PENDING_NEW: {OrderState.SENT, OrderState.ERROR},
+    OrderState.SENT: {
+        OrderState.ACCEPTED, OrderState.REJECTED,
+        OrderState.ERROR, OrderState.FILLED
+    },
+    OrderState.ACCEPTED: {
+        OrderState.PARTIALLY_FILLED, OrderState.FILLED,
+        OrderState.PENDING_CANCEL, OrderState.CANCELED,
+        OrderState.EXPIRED, OrderState.ERROR
+    },
+    OrderState.PARTIALLY_FILLED: {
+        OrderState.PARTIALLY_FILLED, OrderState.FILLED,
+        OrderState.PENDING_CANCEL, OrderState.CANCELED, OrderState.ERROR
+    },
+    OrderState.PENDING_CANCEL: {
+        OrderState.CANCELED, OrderState.FILLED,
+        OrderState.PARTIALLY_FILLED, OrderState.ERROR
+    },
+}
+
+
+class TradeSide(Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class TradeSignal(Enum):
+    NO_TRADE = auto()
+    LONG_ENTRY = auto()
+    LONG_EXIT = auto()
+
+
+class MarketRegime(Enum):
+    UNKNOWN = auto()
+    NORMAL = auto()
+    HIGH_VOLATILITY = auto()
+    LOW_LIQUIDITY = auto()
+    HALTED = auto()
+
+
+class SystemState(Enum):
+    INITIALIZING = auto()
+    VALIDATING = auto()
+    WAITING_FOR_MARKET = auto()
+    TRADING = auto()
+    RISK_DISABLED = auto()
+    FLATTENING = auto()
+    SHUTDOWN = auto()
+    ERROR = auto()
+
+
+@dataclass(frozen=True)
+class AccountConfig:
+    account_type: AccountType = AccountType.CASH
+    environment: Environment = Environment.PAPER
+    paper_starting_capital: Decimal = Decimal("100000.00")
+    live_starting_capital: Decimal = Decimal("1000.00")
+    settlement_days: int = 1
+    max_orders_per_minute: int = 200
+    min_order_size_usd: Decimal = Decimal("1.00")
+    min_share_quantity: int = 1
+    max_notional_per_order: Decimal = Decimal("100000.00")
+    short_selling_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    max_risk_per_trade_pct: Decimal = Decimal("0.02")
+    max_position_pct: Decimal = Decimal("0.20")
+    max_slippage_pct: Decimal = Decimal("0.005")
+    max_spread_pct: Decimal = Decimal("0.003")
+    max_daily_loss_pct: Decimal = Decimal("0.03")
+    max_daily_loss_abs: Decimal = Decimal("30.00")
+    max_consecutive_losses: int = 5
+    max_drawdown_pct: Decimal = Decimal("0.10")
+    max_drawdown_abs: Decimal = Decimal("100.00")
+    max_total_exposure_pct: Decimal = Decimal("0.90")
+    max_simultaneous_positions: int = 3
+    no_new_trades_after: str = "15:45"
+    force_flatten_by: str = "15:55"
+    no_trade_first_minutes: int = 5
+    max_hold_duration_minutes: int = 240
+    allow_overnight: bool = False
+
+
+@dataclass(frozen=True)
+class UniverseConfig:
+    watchlist: list = field(default_factory=lambda: [
+        "MARA","MSTR","RIOT","COIN","HOOD","SMCI","SOFI","AFRM","ENPH","PLTR","TSLA","NVDA","AMD",
+        "SNAP","ROKU","AAPL","AMZN","META","GOOGL","MSFT","NFLX","SHOP","UBER","LYFT","BA","F","GM",
+        "NIO","RIVN","JPM","BAC","GS","C","WFC","XOM","CVX","OXY","SLB","PFE","MRNA","ABBV","WMT",
+        "TGT","COST","DIS","PYPL","INTC","MU","QCOM","FSLR","W","ADBE","CRM"
+    ])
+
+    min_price: Decimal = Decimal("5.00")
+    max_price: Decimal = Decimal("500.00")
+    min_avg_dollar_volume: Decimal = Decimal("5000000")
+    max_spread_pct: Decimal = Decimal("0.003")
+    exclude_halted: bool = True
+    exclude_otc: bool = True
+    universe_refresh_interval_seconds: int = 300
+
+
+@dataclass(frozen=True)
+class DataConfig:
+    max_quote_age_ms: int = 5000
+    max_trade_age_ms: int = 10000
+    max_price_deviation_pct: Decimal = Decimal("0.10")
+    min_bid_ask_sanity_ratio: Decimal = Decimal("0.80")
+    max_timestamp_drift_ms: int = 2000
+    history_lookback_days: int = 60
+    min_history_bars: int = 20
+    primary_bar_interval: str = "1Min"
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    vwap_lookback_bars: int = 20
+    entry_zscore_threshold: Decimal = Decimal("-1.5")
+    exit_zscore_threshold: Decimal = Decimal("-0.3")
+    stop_zscore_threshold: Decimal = Decimal("-2.8")
+    min_volume_ratio: Decimal = Decimal("1.2")
+    rsi_oversold_threshold: int = 35
+    rsi_period: int = 14
+    min_expected_value_per_trade: Decimal = Decimal("0.10")
+    min_win_rate: Decimal = Decimal("0.45")
+    min_profit_factor: Decimal = Decimal("1.3")
+    max_vix_for_trading: Decimal = Decimal("35.0")
+    min_market_volume_ratio: Decimal = Decimal("0.7")
+
+
+@dataclass(frozen=True)
+class MonitoringConfig:
+    max_slippage_deviation: Decimal = Decimal("2.0")
+    slippage_window_trades: int = 20
+    min_acceptable_fill_rate: Decimal = Decimal("0.80")
+    max_api_latency_ms: int = 500
+    heartbeat_interval_seconds: int = 30
+    max_missed_heartbeats: int = 3
+
+
+@dataclass
+class AppConfig:
+    account: AccountConfig = field(default_factory=AccountConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    universe: UniverseConfig = field(default_factory=UniverseConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
+    alpaca_api_key: str = ""
+    alpaca_secret_key: str = ""
+    alpaca_base_url: str = "https://paper-api.alpaca.markets"
+    log_dir: str = "logs"
+    log_level: str = "INFO"
+    timezone: str = "America/New_York"
+    dry_run: bool = False
+
+    def load_credentials(self):
+        self.alpaca_api_key = os.environ.get("ALPACA_API_KEY", "")
+        self.alpaca_secret_key = os.environ.get("ALPACA_SECRET_KEY", "")
+        if not self.alpaca_api_key or not self.alpaca_secret_key:
+            raise ValueError(
+                "Set ALPACA_API_KEY and ALPACA_SECRET_KEY as env vars."
+            )
+
+    @property
+    def starting_capital(self):
+        if self.account.environment == Environment.PAPER:
+            return self.account.paper_starting_capital
+        return self.account.live_starting_capital
+
+    def validate(self):
+        errors = []
+        if self.risk.max_daily_loss_pct > Decimal("0.05"):
+            errors.append("Daily loss limit > 5% is too aggressive")
+        if self.risk.max_drawdown_pct > Decimal("0.15"):
+            errors.append("Max drawdown > 15% makes recovery impossible")
+        if self.account.short_selling_enabled and \
+           self.account.account_type == AccountType.CASH:
+            errors.append("Short selling not available on cash accounts")
+        if not self.risk.allow_overnight and \
+           self.risk.max_hold_duration_minutes > 390:
+            errors.append("Hold duration > market hours but overnight disabled")
+        return errors

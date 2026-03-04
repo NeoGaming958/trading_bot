@@ -1,0 +1,110 @@
+/Users/kevinjewell/trading_bot/venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+18:21:57 [INFO] engine: [SYSTEM] Broker interface initialized | paper=True
+18:21:57 [INFO] engine: [SYSTEM] Risk manager initialized | max_daily_loss=0.03 max_drawdown=0.10
+18:21:57 [INFO] engine: [SYSTEM] Data validator initialized
+18:21:57 [INFO] engine: [SYSTEM] Engine initialized | watchlist=['MARA', 'MSTR', 'RIOT', 'COIN', 'HOOD', 'SMCI', 'SOFI', 'AFRM', 'ENPH', 'PLTR', 'TSLA', 'NVDA', 'AMD', 'SNAP', 'ROKU', 'AAPL', 'AMZN', 'META', 'GOOGL', 'MSFT', 'NFLX', 'SHOP', 'UBER', 'LYFT', 'BA', 'F', 'GM', 'NIO', 'RIVN', 'JPM', 'BAC', 'GS', 'C', 'WFC', 'XOM', 'CVX', 'OXY', 'SLB', 'PFE', 'MRNA', 'ABBV', 'WMT', 'TGT', 'COST', 'DIS', 'PYPL', 'INTC', 'MU', 'QCOM', 'FSLR', 'W', 'ADBE', 'CRM'] cycle_interval=60
+18:21:57 [INFO] engine: [SYSTEM] ==================================================
+18:21:57 [INFO] engine: [SYSTEM] TRADING BOT V1.0 STARTING
+18:21:57 [INFO] engine: [SYSTEM] ==================================================
+18:21:57 [INFO] engine: [SYSTEM] Running startup validation...
+18:21:58 [INFO] engine: [SYSTEM] Account fetched | latency_ms=1058.6
+18:21:58 [WARNING] engine: [LATENCY] API latency exceeded threshold | latency_ms=1058.6 threshold=500
+18:21:58 [INFO] engine: [SYSTEM] Broker connected | equity=100000 status=ACTIVE
+18:21:58 [INFO] engine: [SYSTEM] Market clock OK | is_open=False next_open=2026-03-04 09:30:00-05:00 next_close=2026-03-04 16:00:00-05:00
+18:21:58 [INFO] engine: [SYSTEM] Startup validation PASSED
+18:21:58 [INFO] engine: [SYSTEM] Loading historical data...
+18:22:01 [INFO] engine: [DATA] MARA: loaded 30272 bars
+18:22:03 [INFO] engine: [DATA] MSTR: loaded 34598 bars
+18:22:04 [INFO] engine: [DATA] RIOT: loaded 23547 bars
+18:22:06 [INFO] engine: [DATA] COIN: loaded 30687 bars
+18:22:08 [INFO] engine: [DATA] HOOD: loaded 30329 bars
+18:22:09 [INFO] engine: [DATA] SMCI: loaded 29620 bars
+18:22:11 [INFO] engine: [DATA] SOFI: loaded 32310 bars
+18:22:12 [INFO] engine: [DATA] AFRM: loaded 18846 bars
+18:22:13 [INFO] engine: [DATA] ENPH: loaded 19465 bars
+18:22:14 [INFO] engine: [DATA] PLTR: loaded 33965 bars
+18:22:16 [INFO] engine: [DATA] TSLA: loaded 37467 bars
+18:22:18 [INFO] engine: [DATA] NVDA: loaded 37901 bars
+18:22:21 [INFO] engine: [DATA] AMD: loaded 32846 bars
+18:22:22 [INFO] engine: [DATA] SNAP: loaded 25016 bars
+18:22:23 [INFO] engine: [DATA] ROKU: loaded 17071 bars
+18:22:24 [INFO] engine: [DATA] AAPL: loaded 29834 bars
+18:22:26 [INFO] engine: [DATA] AMZN: loaded 31614 bars
+18:22:27 [INFO] engine: [DATA] META: loaded 29768 bars
+18:22:29 [INFO] engine: [DATA] GOOGL: loaded 29501 bars
+18:22:31 [INFO] engine: [DATA] MSFT: loaded 33942 bars
+18:22:33 [INFO] engine: [DATA] NFLX: loaded 37197 bars
+18:22:34 [INFO] engine: [DATA] SHOP: loaded 19725 bars
+18:22:35 [INFO] engine: [DATA] UBER: loaded 20794 bars
+18:22:36 [INFO] engine: [DATA] LYFT: loaded 19148 bars
+18:22:37 [INFO] engine: [DATA] BA: loaded 19510 bars
+18:22:38 [INFO] engine: [DATA] F: loaded 21919 bars
+18:22:39 [INFO] engine: [DATA] GM: loaded 17280 bars
+18:22:41 [INFO] engine: [DATA] NIO: loaded 27039 bars
+18:22:42 [INFO] engine: [DATA] RIVN: loaded 24692 bars
+18:22:43 [INFO] engine: [DATA] JPM: loaded 21175 bars
+18:22:45 [INFO] engine: [DATA] BAC: loaded 20417 bars
+18:22:46 [INFO] engine: [DATA] GS: loaded 17819 bars
+18:22:47 [INFO] engine: [DATA] C: loaded 18432 bars
+18:22:47 [INFO] engine: [DATA] WFC: loaded 17444 bars
+18:22:49 [INFO] engine: [DATA] XOM: loaded 21339 bars
+18:22:50 [INFO] engine: [DATA] CVX: loaded 20407 bars
+18:22:51 [INFO] engine: [DATA] OXY: loaded 22435 bars
+18:22:52 [INFO] engine: [DATA] SLB: loaded 19240 bars
+18:22:53 [INFO] engine: [DATA] PFE: loaded 24777 bars
+18:22:55 [INFO] engine: [DATA] MRNA: loaded 21495 bars
+18:22:56 [INFO] engine: [DATA] ABBV: loaded 16439 bars
+18:22:57 [INFO] engine: [DATA] WMT: loaded 20940 bars
+18:22:58 [INFO] engine: [DATA] TGT: loaded 17226 bars
+18:22:59 [INFO] engine: [DATA] COST: loaded 17523 bars
+18:23:00 [INFO] engine: [DATA] DIS: loaded 17835 bars
+18:23:01 [INFO] engine: [DATA] PYPL: loaded 24894 bars
+18:23:03 [INFO] engine: [DATA] INTC: loaded 35775 bars
+18:23:05 [INFO] engine: [DATA] MU: loaded 34900 bars
+18:23:07 [INFO] engine: [DATA] QCOM: loaded 19279 bars
+18:23:08 [INFO] engine: [DATA] FSLR: loaded 16620 bars
+18:23:09 [INFO] engine: [DATA] W: loaded 16214 bars
+18:23:10 [INFO] engine: [DATA] ADBE: loaded 20616 bars
+18:23:11 [INFO] engine: [DATA] CRM: loaded 21037 bars
+18:23:11 [INFO] engine: [SYSTEM] Positions fetched | count=0
+18:23:12 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:24:13 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:25:14 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:26:15 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:27:16 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:28:16 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:29:17 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:30:18 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:31:19 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:32:20 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:33:20 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:34:21 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:35:22 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:36:23 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:37:24 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:38:24 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:39:25 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:40:26 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:41:27 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:42:27 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:43:28 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:44:29 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:45:30 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:46:31 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:47:31 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:48:32 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:35:44 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:36:45 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:37:46 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:38:47 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:39:47 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:40:48 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:41:49 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:42:50 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:43:51 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:44:51 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:45:52 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:46:53 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:47:54 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00
+18:48:54 [INFO] engine: [SYSTEM] Market closed. Next open: 2026-03-04 09:30:00-05:00

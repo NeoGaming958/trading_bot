@@ -1,0 +1,765 @@
+"""
+Core Engine - Main trading loop that orchestrates all subsystems.
+This is the brain. It connects data -> strategy -> risk -> execution.
+Runs as an event loop during market hours.
+"""
+import time
+import signal as sig
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
+from typing import Dict, Optional
+import pytz
+
+from config.settings import (
+    AppConfig, SystemState, TradeSignal, OrderState
+)
+from utils.logger import StructuredLogger
+from core.broker import BrokerInterface
+from core.cash_ledger import CashLedger
+from risk.manager import RiskManager
+from data.validator import DataValidator, QuoteData
+from strategy.mean_reversion import MeanReversionStrategy
+
+
+class Position:
+    """Tracks a single open position."""
+
+    def __init__(self, symbol, qty, entry_price, entry_time, order_id):
+        self.symbol = symbol
+        self.qty = int(qty)
+        self.entry_price = Decimal(str(entry_price))
+        self.entry_time = entry_time
+        self.order_id = order_id
+        self.unrealized_pnl = Decimal("0.00")
+
+    def update_pnl(self, current_price):
+        price = Decimal(str(current_price))
+        self.unrealized_pnl = (price - self.entry_price) * self.qty
+
+    def to_dict(self):
+        return {
+            "symbol": self.symbol,
+            "qty": self.qty,
+            "entry_price": str(self.entry_price),
+            "entry_time": self.entry_time.isoformat(),
+            "unrealized_pnl": str(self.unrealized_pnl),
+        }
+
+
+class TradingEngine:
+    """
+    Main event loop. Responsibilities:
+    1. Fetch data and validate it
+    2. Run strategy to generate signals
+    3. Pass signals through risk checks
+    4. Execute approved trades via broker
+    5. Monitor and reconcile continuously
+    6. Handle all error states safely
+    """
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.log = StructuredLogger("engine", config.log_dir, config.log_level)
+
+        # Initialize subsystems
+        self.broker = BrokerInterface(config, self.log)
+        self.cash_ledger = CashLedger(config)
+        self.risk = RiskManager(config, self.log)
+        self.validator = DataValidator(config, self.log)
+        self.strategy = MeanReversionStrategy(config, self.log)
+
+        # State
+        self.state = SystemState.INITIALIZING
+        self.positions: Dict[str, Position] = {}
+        self.open_orders: Dict[str, dict] = {}  # order_id -> metadata
+        self.daily_trades: list = []
+        self.et_tz = pytz.timezone(config.timezone)
+
+        # Watchlist — symbols we actively monitor
+        # V1.0: static list of liquid large-caps
+        self.watchlist = [
+            "TSLA", "AMD", "NVDA", "COIN", "MARA",
+            "RIOT", "SOFI", "PLTR", "SNAP", "ROKU",
+            "SQ", "SHOP", "SMCI", "ARM", "MSTR",
+            "AFRM", "HOOD", "ENPH",
+            "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+            "SPY", "QQQ",
+        ]
+
+        # Bar data cache: symbol -> {closes, highs, lows, volumes}
+        self.bar_cache: Dict[str, dict] = {}
+
+        # Cycle timing
+        self.cycle_interval = 60  # seconds between main loop cycles
+        self.last_reconcile = 0
+        self.reconcile_interval = 300  # reconcile every 5 minutes
+
+        # Shutdown handling
+        self.shutdown_requested = False
+        sig.signal(sig.SIGINT, self._handle_shutdown)
+        sig.signal(sig.SIGTERM, self._handle_shutdown)
+
+        self.log.log_system("Engine initialized",
+                            watchlist=self.watchlist,
+                            cycle_interval=self.cycle_interval)
+
+    def _handle_shutdown(self, signum, frame):
+        """Graceful shutdown on Ctrl+C."""
+        self.log.log_system("Shutdown signal received",
+                            signal=signum)
+        self.shutdown_requested = True
+
+    # ── Main Loop ──────────────────────────────────────────────────────
+
+    def run(self):
+        """Main entry point. Runs until shutdown or market close."""
+        self.log.log_system("=" * 50)
+        self.log.log_system("TRADING BOT V1.0 STARTING")
+        self.log.log_system("=" * 50)
+
+        try:
+            # Step 1: Validate everything
+            if not self._startup_validation():
+                self.log.critical("SYSTEM", "Startup validation FAILED")
+                return
+
+            # Step 2: Load historical data for indicators
+            self._load_historical_data()
+
+            # Step 3: Sync with broker state
+            self._sync_broker_state()
+
+            # Step 4: Main trading loop
+            self.state = SystemState.WAITING_FOR_MARKET
+            self._main_loop()
+
+        except Exception as e:
+            self.log.critical("SYSTEM", f"Unhandled exception: {e}")
+            self.state = SystemState.ERROR
+        finally:
+            self._shutdown()
+
+    def _main_loop(self):
+        """Core loop: runs every cycle_interval seconds."""
+        while not self.shutdown_requested:
+            cycle_start = time.monotonic()
+
+            try:
+                # Check market status
+                if not self.broker.is_market_open():
+                    if self.state == SystemState.TRADING:
+                        self.log.log_system("Market closed")
+                        self._end_of_day_report()
+                        self.state = SystemState.WAITING_FOR_MARKET
+                    self._wait_for_market()
+                    continue
+
+                # Market is open
+                if self.state == SystemState.WAITING_FOR_MARKET:
+                    self.log.log_system("Market OPEN - starting trading")
+                    self.state = SystemState.TRADING
+
+                if self.state == SystemState.RISK_DISABLED:
+                    # Still monitor positions but don't enter new ones
+                    self._check_existing_positions()
+                    self._check_force_flatten()
+                elif self.state == SystemState.TRADING:
+                    self._trading_cycle()
+
+                # Periodic reconciliation
+                now = time.monotonic()
+                if now - self.last_reconcile > self.reconcile_interval:
+                    self._reconcile()
+                    self.last_reconcile = now
+
+            except KeyboardInterrupt:
+                self.shutdown_requested = True
+            except Exception as e:
+                self.log.error("SYSTEM", f"Cycle error: {e}")
+                # Don't crash on single cycle failure
+                time.sleep(5)
+
+            # Pace the loop
+            elapsed = time.monotonic() - cycle_start
+            sleep_time = max(0, self.cycle_interval - elapsed)
+            if sleep_time > 0 and not self.shutdown_requested:
+                time.sleep(sleep_time)
+
+    def _trading_cycle(self):
+        """One complete trading cycle."""
+        # Update settlements and order states
+        self.cash_ledger.process_settlements()
+        self._update_orders_and_ledger()
+
+        self.log.log_system("--- Trading cycle start ---",
+                            positions=len(self.positions))
+
+        # Check force flatten time
+        if self._check_force_flatten():
+            return
+
+        # Process each symbol
+        for symbol in self.watchlist:
+            if self.shutdown_requested:
+                break
+
+            try:
+                self._process_symbol(symbol)
+            except Exception as e:
+                self.log.error("SYSTEM",
+                               f"Error processing {symbol}: {e}")
+
+        # Check existing positions for exits
+        self._check_existing_positions()
+
+        # Log cycle summary
+        equity = self.broker.get_equity()
+        self.risk.update_equity(equity)
+        self.log.log_system("--- Trading cycle end ---",
+                            equity=str(equity),
+                            risk_status=self.risk.get_status())
+
+    def _process_symbol(self, symbol):
+        """Fetch data, validate, generate signal, execute if approved."""
+
+        # 1. Get latest quote
+        raw_quote = self.broker.get_latest_quote(symbol)
+        if raw_quote is None:
+            return
+
+        # 2. Validate quote
+        valid, quote, reason = self.validator.validate_quote(
+            symbol,
+            bid=raw_quote.bid_price,
+            ask=raw_quote.ask_price,
+            bid_size=raw_quote.bid_size,
+            ask_size=raw_quote.ask_size,
+            timestamp=raw_quote.timestamp
+        )
+
+        if not valid:
+            self.log.log_data(f"{symbol}: quote invalid - {reason}")
+            return
+
+        # 3. Update bar cache with latest data
+        self._update_bar_cache(symbol, quote)
+
+        # 4. Check universe eligibility
+        if symbol in self.bar_cache:
+            bars = self.bar_cache[symbol]
+            if len(bars["volumes"]) > 0:
+                avg_dv = float(
+                    sum(c * v for c, v in
+                        zip(bars["closes"][-20:], bars["volumes"][-20:]))
+                ) / min(len(bars["closes"]), 20)
+            else:
+                avg_dv = 0
+
+            eligible, ereason = self.validator.check_universe_eligibility(
+                symbol, float(quote.mid), avg_dv, float(quote.spread_pct)
+            )
+            if not eligible:
+                return
+
+        # 5. Feed strategy
+        if symbol in self.bar_cache:
+            bars = self.bar_cache[symbol]
+            if len(bars["closes"]) >= self.config.strategy.vwap_lookback_bars:
+                self.strategy.update_bars(
+                    symbol,
+                    bars["closes"], bars["highs"],
+                    bars["lows"], bars["volumes"]
+                )
+
+        # 6. Generate signal
+        has_position = symbol in self.positions
+        signal, meta = self.strategy.generate_signal(symbol, has_position)
+
+        if signal == TradeSignal.NO_TRADE:
+            return
+
+        # 7. Process signal
+        if signal == TradeSignal.LONG_ENTRY:
+            self._handle_entry(symbol, quote, meta)
+        elif signal == TradeSignal.LONG_EXIT:
+            self._handle_exit(symbol, quote, meta)
+
+    def _handle_entry(self, symbol, quote: QuoteData, signal_meta):
+        """Process a long entry signal through risk checks and execution."""
+
+        # Get buying power
+        buying_power = self.cash_ledger.available_settled_cash()
+
+        # Calculate stop price
+        stop_price = self.strategy.get_stop_price(symbol)
+        if stop_price is None:
+            self.log.warning("EXECUTION",
+                             "Cannot calculate stop - skipping",
+                             symbol=symbol)
+            return
+
+        # Calculate position size
+        shares = self.risk.calculate_position_size(
+            price=float(quote.ask),  # Assume we pay the ask
+            stop_price=float(stop_price),
+            buying_power=buying_power
+        )
+
+        if shares <= 0:
+            return
+
+        # Estimate expected value
+        state = self.strategy.get_state(symbol)
+        ev, ev_details = self.strategy.estimate_expected_value(
+            entry_price=float(quote.ask),
+            vwap=state["vwap"],
+            stop_price=float(stop_price),
+            spread_cost=float(quote.spread),
+            slippage_est=float(quote.mid * Decimal("0.001")),
+            win_rate=0.50
+        )
+
+        # Check EV meets minimum
+        total_ev = ev * shares
+        if total_ev < self.config.strategy.min_expected_value_per_trade:
+            self.log.log_signal(
+                symbol, "ENTRY_REJECTED",
+                reason="ev_too_low",
+                ev_per_share=str(ev),
+                total_ev=str(total_ev),
+                min_required=str(
+                    self.config.strategy.min_expected_value_per_trade)
+            )
+            return
+
+        # Pre-trade risk check
+        approved, reason = self.risk.pre_trade_check(
+            symbol=symbol,
+            side="buy",
+            qty=shares,
+            price=float(quote.ask),
+            buying_power=buying_power,
+            spread_pct=float(quote.spread_pct),
+            expected_slippage_pct=Decimal("0.001")
+        )
+
+        if not approved:
+            self.log.log_signal(symbol, "ENTRY_BLOCKED",
+                                reason=reason, shares=shares)
+            return
+
+        # Execute
+        if self.config.dry_run:
+            self.log.log_order("DRY_RUN_BUY", symbol=symbol,
+                               qty=shares, price=str(quote.ask))
+            return
+
+        # Reserve settled cash for this BUY (prevents over-commit and unsettled reuse)
+        est_cost = Decimal(str(quote.ask)) * Decimal(str(shares))
+        if not self.cash_ledger.can_reserve(est_cost):
+            self.log.log_signal(symbol, "ENTRY_BLOCKED", reason="unsettled_or_reserved_cash", shares=shares)
+            return
+
+        # Use limit order at the ask for controlled entry
+        order = self.broker.submit_limit_order(
+            symbol=symbol,
+            qty=shares,
+            side="buy",
+            limit_price=quote.ask,
+            time_in_force="day"
+        )
+
+        if order:
+            oid = str(order.id)
+            self.cash_ledger.reserve_buy(oid, est_cost)
+            self.open_orders[oid] = {"symbol": symbol, "side": "buy", "qty": shares, "est_price": str(quote.ask)}
+            # Position will be added on fill by _update_orders_and_ledger
+
+            self.log.log_order("ENTRY_SUBMITTED",
+                               symbol=symbol,
+                               qty=shares,
+                               price=str(quote.ask),
+                               stop=str(stop_price),
+                               ev_per_share=str(ev),
+                               total_ev=str(total_ev),
+                               order_id=str(order.id))
+
+    def _handle_exit(self, symbol, quote: QuoteData, signal_meta):
+        """Process a long exit signal."""
+        if symbol not in self.positions:
+            return
+
+        pos = self.positions[symbol]
+
+        if self.config.dry_run:
+            pos.update_pnl(float(quote.bid))
+            self.log.log_order("DRY_RUN_SELL", symbol=symbol,
+                               qty=pos.qty, pnl=str(pos.unrealized_pnl))
+            return
+
+        # Market order for exits — we want OUT
+        # Submit exit (sell). Proceeds are treated as UNSETTLED until settlement.
+        order = self.broker.submit_market_order(
+            symbol=symbol,
+            qty=pos.qty,
+            side="sell"
+        )
+
+        if order:
+            oid = str(order.id)
+            self.open_orders[oid] = {"symbol": symbol, "side": "sell", "qty": pos.qty, "est_price": str(quote.bid)}
+            # Remove internal position immediately to avoid duplicate exits; ledger updates on fill.
+            del self.positions[symbol]
+            pos_map = {s: {"qty": p.qty} for s, p in self.positions.items()}
+            self.risk.update_positions(pos_map)
+
+            self.log.log_order("EXIT_EXECUTED",
+                               symbol=symbol,
+                               qty=pos.qty,
+                               entry=str(pos.entry_price),
+                               exit=str(exit_price),
+                               pnl=str(pnl),
+                               reason=signal_meta.get("reason"))
+
+            self.log.log_pnl(symbol=symbol,
+                             trade_pnl=str(pnl),
+                             daily_pnl=str(self.risk.daily_pnl))
+
+    # ── Position Management ────────────────────────────────────────────
+
+    def _check_existing_positions(self):
+        """Check all positions for time-based exits."""
+        for symbol in list(self.positions.keys()):
+            pos = self.positions[symbol]
+
+            # Update P&L with latest quote
+            quote = self.broker.get_latest_quote(symbol)
+            if quote:
+                pos.update_pnl(float(quote.bid_price))
+
+            # Check hold duration
+            if self.risk.check_hold_duration(symbol, pos.entry_time):
+                self.log.warning("RISK",
+                                 "Max hold duration — forcing exit",
+                                 symbol=symbol)
+                self._force_exit(symbol, "max_hold_duration")
+
+    def _check_force_flatten(self):
+        """Flatten all positions if past force-flatten time."""
+        if self.risk.check_force_flatten():
+            if self.positions:
+                self.log.critical("RISK",
+                                  "FORCE FLATTEN TIME - closing all",
+                                  positions=list(self.positions.keys()))
+                self._flatten_all("force_flatten_time")
+            return True
+        return False
+
+    def _force_exit(self, symbol, reason):
+        """Force exit a single position."""
+        if symbol not in self.positions:
+            return
+
+        if self.config.dry_run:
+            self.log.log_order("DRY_RUN_FORCE_EXIT",
+                               symbol=symbol, reason=reason)
+            return
+
+        success = self.broker.close_position(symbol)
+        if success:
+            pos = self.positions[symbol]
+            self.log.log_order("FORCE_EXIT", symbol=symbol,
+                               qty=pos.qty, reason=reason)
+            del self.positions[symbol]
+
+    def _flatten_all(self, reason):
+        """Emergency: close everything."""
+        self.log.critical("SYSTEM",
+                          f"FLATTEN ALL: {reason}")
+
+        if not self.config.dry_run:
+            self.broker.cancel_all_orders()
+            self.open_orders.clear()  # start clean
+            self.cash_ledger.reserved.clear()
+            self.broker.close_all_positions()
+
+        self.positions.clear()
+        pos_map = {}
+        self.risk.update_positions(pos_map)
+        self.state = SystemState.FLATTENING
+
+    # ── Data Management ────────────────────────────────────────────────
+
+    def _load_historical_data(self):
+        """Load historical bars for all watchlist symbols."""
+        self.log.log_system("Loading historical data...")
+        from alpaca.data.timeframe import TimeFrame
+
+        for symbol in self.watchlist:
+            try:
+                bars = self.broker.get_historical_bars(
+                    symbol,
+                    days=self.config.data.history_lookback_days,
+                    timeframe=TimeFrame.Minute
+                )
+
+                if bars and len(bars) > 0:
+                    closes = [float(b.close) for b in bars]
+                    highs = [float(b.high) for b in bars]
+                    lows = [float(b.low) for b in bars]
+                    volumes = [float(b.volume) for b in bars]
+
+                    self.bar_cache[symbol] = {
+                        "closes": closes,
+                        "highs": highs,
+                        "lows": lows,
+                        "volumes": volumes,
+                    }
+
+                    self.log.log_data(
+                        f"{symbol}: loaded {len(closes)} bars")
+                else:
+                    self.log.warning("DATA",
+                                     f"{symbol}: no historical data")
+
+            except Exception as e:
+                self.log.error("DATA",
+                               f"{symbol}: history load failed: {e}")
+
+    def _update_bar_cache(self, symbol, quote: QuoteData):
+        """Append latest quote as a pseudo-bar to cache."""
+        if symbol not in self.bar_cache:
+            self.bar_cache[symbol] = {
+                "closes": [], "highs": [],
+                "lows": [], "volumes": []
+            }
+
+        cache = self.bar_cache[symbol]
+        mid = float(quote.mid)
+        cache["closes"].append(mid)
+        cache["highs"].append(float(quote.ask))
+        cache["lows"].append(float(quote.bid))
+        cache["volumes"].append(float(quote.bid_size + quote.ask_size))
+
+        # Keep only last 500 bars
+        max_bars = 500
+        for key in cache:
+            if len(cache[key]) > max_bars:
+                cache[key] = cache[key][-max_bars:]
+
+    # ── Startup & Validation ───────────────────────────────────────────
+
+    def _startup_validation(self):
+        """Validate everything before trading."""
+        self.state = SystemState.VALIDATING
+        self.log.log_system("Running startup validation...")
+
+        # Config validation
+        errors = self.config.validate()
+        if errors:
+            for e in errors:
+                self.log.error("VALIDATION", e)
+            return False
+
+        # Broker connectivity
+        try:
+            account = self.broker.get_account()
+            equity = Decimal(str(account.equity))
+            self.log.log_system("Broker connected",
+                                equity=str(equity),
+                                status=account.status)
+
+            # Initialize settled cash ledger (cash-account conservative)
+            try:
+                self.cash_ledger.initialize_from_cash(Decimal(str(account.cash)))
+            except Exception:
+                pass
+
+            # Update risk manager with actual equity
+            self.risk.update_equity(equity)
+
+        except Exception as e:
+            self.log.critical("VALIDATION",
+                              f"Broker connection failed: {e}")
+            return False
+
+        # Market clock
+        clock = self.broker.get_clock()
+        if clock:
+            self.log.log_system("Market clock OK",
+                                is_open=clock.is_open,
+                                next_open=str(clock.next_open),
+                                next_close=str(clock.next_close))
+
+        self.log.log_system("Startup validation PASSED")
+        return True
+
+    def _sync_broker_state(self):
+        """Sync internal state with broker on startup."""
+        # Check for any existing positions
+        positions = self.broker.get_positions()
+        for pos in positions:
+            self.log.warning("SYSTEM",
+                             f"Found existing position: {pos.symbol} "
+                             f"x{pos.qty}")
+            self.positions[pos.symbol] = Position(
+                symbol=pos.symbol,
+                qty=int(pos.qty),
+                entry_price=Decimal(str(pos.avg_entry_price)),
+                entry_time=datetime.now(self.et_tz),  # Approximate
+                order_id="synced_from_broker"
+            )
+
+        # Check for open orders
+        open_orders = self.broker.get_open_orders()
+        if open_orders:
+            self.log.warning("SYSTEM",
+                             f"Found {len(open_orders)} open orders "
+                             f"- canceling for clean start")
+            self.broker.cancel_all_orders()
+            self.open_orders.clear()  # start clean
+            self.cash_ledger.reserved.clear()
+
+
+    def _update_orders_and_ledger(self):
+        """Poll broker for order status changes; update positions and cash ledger."""
+        if not self.open_orders:
+            return
+
+        # Get current open orders from broker
+        broker_open = {str(o.id): o for o in self.broker.get_open_orders()}
+
+        done_ids = []
+        for oid, meta in list(self.open_orders.items()):
+            if oid in broker_open:
+                continue  # still working
+
+            # Order is no longer open -> fetch final status
+            order = self.broker.get_order(oid)
+            if order is None:
+                continue
+
+            status = str(getattr(order, "status", "")).lower()
+            filled_qty = int(float(getattr(order, "filled_qty", 0) or 0))
+            filled_avg = getattr(order, "filled_avg_price", None)
+            side = meta["side"]
+            symbol = meta["symbol"]
+
+            if status in ("canceled", "rejected", "expired"):
+                # release reservation if it was a buy
+                if side == "buy":
+                    self.cash_ledger.release_reservation(oid)
+                done_ids.append(oid)
+                continue
+
+            if status == "filled" and filled_qty > 0:
+                # Determine fill price; fall back to submitted estimate
+                fill_price = Decimal(str(filled_avg)) if filled_avg else Decimal(str(meta.get("est_price", "0")))
+                notional = fill_price * Decimal(str(filled_qty))
+
+                if side == "buy":
+                    self.cash_ledger.confirm_buy_fill(oid, notional)
+                    # create/refresh position only on fill
+                    self.positions[symbol] = Position(
+                        symbol=symbol,
+                        qty=filled_qty,
+                        entry_price=fill_price,
+                        entry_time=datetime.now(self.et_tz),
+                        order_id=oid
+                    )
+                else:
+                    # sell fill: proceeds are unsettled until settlement
+                    self.cash_ledger.record_sell_fill(notional, datetime.now(self.et_tz))
+                    # remove position on filled sell
+                    if symbol in self.positions:
+                        del self.positions[symbol]
+
+                    # record trade result conservatively (no exact entry tracking here)
+                    # Risk manager pnl is already tracked elsewhere; keep ledger primary.
+
+                done_ids.append(oid)
+
+        for oid in done_ids:
+            self.open_orders.pop(oid, None)
+
+        # update risk manager positions map
+        pos_map = {s: {"qty": p.qty} for s, p in self.positions.items()}
+        self.risk.update_positions(pos_map)
+
+    def _reconcile(self):
+        """Periodic reconciliation against broker."""
+        internal = {s: {"qty": p.qty}
+                    for s, p in self.positions.items()}
+        matched, discrepancies = self.broker.reconcile_positions(internal)
+
+        if not matched:
+            self.log.critical("RECONCILIATION",
+                              "STATE MISMATCH - disabling trading",
+                              discrepancies=discrepancies)
+            self.state = SystemState.RISK_DISABLED
+            self.risk.trading_disabled = True
+            self.risk.disable_reason = "reconciliation_mismatch"
+
+    # ── Market Waiting ─────────────────────────────────────────────────
+
+    def _wait_for_market(self):
+        """Wait for market to open."""
+        clock = self.broker.get_clock()
+        if clock:
+            next_open = clock.next_open
+            self.log.log_system(f"Market closed. Next open: {next_open}")
+
+        # Wait 60 seconds then check again
+        for _ in range(60):
+            if self.shutdown_requested:
+                return
+            time.sleep(1)
+
+    # ── Reporting ──────────────────────────────────────────────────────
+
+    def _end_of_day_report(self):
+        """Generate end-of-day summary."""
+        self.log.log_system("=" * 40)
+        self.log.log_system("END OF DAY REPORT")
+        self.log.log_system("=" * 40)
+
+        self.log.log_pnl(
+            daily_pnl=str(self.risk.daily_pnl),
+            total_trades=len(self.daily_trades),
+            consecutive_losses=self.risk.consecutive_losses,
+            peak_equity=str(self.risk.peak_equity),
+            current_equity=str(self.risk.current_equity),
+        )
+
+        for trade in self.daily_trades:
+            self.log.log_system(f"  Trade: {trade}")
+
+        self.daily_trades.clear()
+        self.log.log_system("=" * 40)
+
+    def _shutdown(self):
+        """Clean shutdown."""
+        self.log.log_system("Initiating shutdown...")
+
+        # Flatten if we have positions and market is open
+        if self.positions and self.broker.is_market_open():
+            self.log.warning("SYSTEM",
+                             "Shutting down with open positions "
+                             "- flattening")
+            self._flatten_all("shutdown")
+
+        self.state = SystemState.SHUTDOWN
+        self.log.log_system("Shutdown complete")
+
+    # ── Status ─────────────────────────────────────────────────────────
+
+    def get_status(self):
+        """Full system status."""
+        return {
+            "state": self.state.name,
+            "positions": {s: p.to_dict()
+                          for s, p in self.positions.items()},
+            "risk": self.risk.get_status(),
+            "watchlist": self.watchlist,
+            "daily_trades": len(self.daily_trades),
+        }

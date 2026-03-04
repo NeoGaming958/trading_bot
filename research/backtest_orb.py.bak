@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""
+ORB Backtest V4.1 — Corrected Paper-Match (Zarattini/Barbon/Aziz 2024)
+=======================================================================
+"A Profitable Day Trading Strategy For The U.S. Equity Market"
+
+PAPER SPEC (exact quotes from the paper):
+  - "5-minute ORB"
+  - "stop order at a level equal to the high/low of the 5-minute range"
+  - "we set a stop loss at 10% of the ATR"
+  - "If the stop loss was not reached intraday, we closed the position
+     at the end of the trading session (i.e., 4:00 pm ET)"
+  - "each stock was traded such that in case of the stop loss being hit,
+     the resulting loss incurred on the capital deployed for that position
+     would be 1%"
+  - "maximum leverage constraint at 4x"
+  - Price > $5, Avg Volume 14 days > 1,000,000, ATR 14 days > $0.50
+  - "Relative Volume was at least 100%" (i.e., >= 2x normal)
+  - "top 20 stocks experiencing the highest Relative Volume"
+
+FIXES from V4.0 (based on forensic paper comparison):
+  1. STOP: 0.10 × ATR from entry (was ORB low — way too wide, inverted R:R)
+  2. ENTRY: At ORB high/low exactly (was bar close — late and worse price)
+  3. ONE TRADE PER STOCK PER DAY (was unlimited re-entry — multiplied losses)
+  4. VWAP REMOVED (not in the paper — was filtering valid setups)
+  5. MIN AVG DAILY VOLUME >= 1M (was missing — allowed illiquid stocks)
+  6. EXPANDED UNIVERSE: 50 liquid stocks (was 15 — too small for "in play")
+  7. MAX LEVERAGE 4x (was 0.95x — limited position sizing)
+
+Usage: python research/backtest_orb.py
+"""
+import os, sys
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta, timezone
+from collections import Counter
+from dataclasses import dataclass
+from typing import Dict
+
+# ── Data fetching (SIP feed) ───────────────────────────────────────
+
+def get_alpaca_client():
+    from alpaca.data.historical import StockHistoricalDataClient
+    k = os.environ.get("ALPACA_API_KEY", "")
+    s = os.environ.get("ALPACA_SECRET_KEY", "")
+    if not k or not s:
+        return None
+    return StockHistoricalDataClient(api_key=k, secret_key=s)
+
+def fetch_alpaca(client, symbol, days, tf, feed="sip"):
+    from alpaca.data.requests import StockBarsRequest
+    start = datetime.now(timezone.utc) - timedelta(days=days)
+    request = StockBarsRequest(
+        symbol_or_symbols=[symbol],
+        timeframe=tf,
+        start=start,
+        feed=feed,
+    )
+    bars = client.get_stock_bars(request)
+    bl = getattr(bars, 'data', {}).get(symbol) if hasattr(bars, 'data') else None
+    if bl is None:
+        try:
+            bl = bars[symbol]
+        except:
+            pass
+    if not bl:
+        return None
+    rows = [{
+        "timestamp": b.timestamp,
+        "open": float(b.open), "high": float(b.high),
+        "low": float(b.low), "close": float(b.close),
+        "volume": float(b.volume),
+        "vwap": float(b.vwap) if hasattr(b, "vwap") and b.vwap else float(b.close)
+    } for b in bl]
+    return pd.DataFrame(rows).set_index("timestamp").sort_index()
+
+def daily_atr_series(df, period=14):
+    h = df["high"].values.astype(float)
+    l = df["low"].values.astype(float)
+    c = df["close"].values.astype(float)
+    n = len(h)
+    out = [None] * n
+    for i in range(period, n):
+        wh, wl = h[i - period + 1:i + 1], l[i - period + 1:i + 1]
+        wc = c[i - period:i]
+        tr = np.maximum(
+            wh[1:] - wl[1:],
+            np.maximum(np.abs(wh[1:] - wc[1:]), np.abs(wl[1:] - wc[1:]))
+        )
+        out[i] = float(np.mean(tr))
+    return out
+
+# ── RVOL: apples-to-apples opening volume ──────────────────────────
+
+def build_opening_vol_history(minute_data: Dict[str, pd.DataFrame], orb_bars=5):
+    history = {}
+    for sym, df in minute_data.items():
+        vol_by_day = {}
+        dates = sorted(set(
+            d.date() if hasattr(d, 'date') else pd.Timestamp(d).date()
+            for d in df.index
+        ))
+        for dt in dates:
+            day_bars = df[df.index.date == dt].head(orb_bars)
+            if len(day_bars) >= orb_bars:
+                vol_by_day[dt] = float(day_bars["volume"].sum())
+        history[sym] = vol_by_day
+    return history
+
+def get_rvol(opening_vols, symbol, today, lookback=14):
+    if symbol not in opening_vols:
+        return None
+    hist = opening_vols[symbol]
+    past_dates = sorted([d for d in hist if d < today])[-lookback:]
+    if len(past_dates) < 5:
+        return None
+    avg_vol = np.mean([hist[d] for d in past_dates])
+    if avg_vol <= 0:
+        return None
+    today_vol = hist.get(today, 0)
+    if today_vol <= 0:
+        return None
+    return today_vol / avg_vol
+
+def get_avg_daily_vol(daily_stats, symbol, date, lookback=14):
+    """Get average daily volume over past N days. Paper requires >= 1M."""
+    ds = daily_stats.get(symbol)
+    if ds is None:
+        return 0
+    past = ds[ds.index.date < date] if hasattr(ds.index[0], 'date') else ds[ds.index < date]
+    past = past.tail(lookback)
+    if len(past) < lookback:
+        return 0
+    return float(past["volume"].mean())
+
+# ── Trade + cost ────────────────────────────────────────────────────
+
+@dataclass
+class Trade:
+    symbol: str; direction: str
+    entry_time: object; exit_time: object
+    entry_price: float; exit_price: float; shares: int
+    gross_pnl: float; costs: float; net_pnl: float
+    hold_bars: int; exit_reason: str; rvol: float
+    r_multiple: float  # NEW: PnL in R units
+
+def calc_costs(price, shares, slip=0.0005):
+    return (price * 0.001 / 2 + price * slip + price * 0.0000278 + 0.000166) * shares
+
+# ── Paper-Matched Backtester ────────────────────────────────────────
+
+def run(minute_data, daily_stats, opening_vols, symbols,
+        capital=100000.0, slip=0.0005, verbose=False,
+        rvol_threshold=2.0, max_positions=20,
+        stop_atr_pct=0.10, max_leverage=4.0,
+        min_avg_daily_vol=1_000_000):
+    """
+    Paper-matched ORB backtest.
+
+    Entry: Stop order at ORB high (long) or ORB low (short).
+           Simulated: if bar high >= ORB high, fill at ORB high.
+    Stop:  0.10 × ATR from entry price.
+    Exit:  EOD close or stop loss. Nothing else.
+    Size:  1% risk per trade. Max leverage 4x. Cap at equal-weight.
+    Filter: Price>$5, ATR>$0.50, AvgVol>1M, RVOL>=threshold.
+    Once per stock per day.
+    """
+    ORB_BARS = 5
+    MIN_ATR = 0.50
+    MIN_PRICE = 5.0
+    EOD_BAR = 389       # 3:59pm ET (bar 389 of 390)
+    RISK_PCT = 0.01
+
+    equity = capital
+    eq_curve = [equity]
+    trades = []
+    rej = Counter()
+    positions = {}       # {symbol: pos_dict}
+    current_day = None
+    day_bar = 0
+    orb = {}
+    daily_pnl = 0.0
+    disabled = False
+    rvol_today = {}
+    traded_today = set()  # FIX #3: one trade per stock per day
+    pending_orders = {}   # FIX #2: simulated stop orders {symbol: order_dict}
+
+    # Build unified timestamp series
+    all_ts = set()
+    for s in symbols:
+        if s in minute_data:
+            all_ts.update(minute_data[s].index.tolist())
+    all_ts = sorted(all_ts)
+    print(f"  {len(all_ts)} bars, {len(symbols)} syms, ${capital:,.0f}, "
+          f"RVOL>={rvol_threshold}x, stop={stop_atr_pct}×ATR, "
+          f"max_pos={max_positions}, lev={max_leverage}x")
+
+    def get_atr(sym, dt):
+        ds = daily_stats.get(sym)
+        if ds is None:
+            return None
+        for t in sorted(ds.index, reverse=True):
+            d = t.date() if hasattr(t, 'date') else t
+            if d <= dt:
+                val = ds.loc[t, "atr"]
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    return val
+        return None
+
+    def close_pos(sym, ep, et, reason):
+        nonlocal equity, daily_pnl
+        if sym not in positions:
+            return
+        p = positions[sym]
+        c = calc_costs(ep, p["sh"], slip)
+        if p["dir"] == "long":
+            g = (ep - p["en"]) * p["sh"]
+        else:
+            g = (p["en"] - ep) * p["sh"]
+        n = g - c - p["ec"]
+        # R-multiple: how many R did we make/lose?
+        risk_per_share = p["atr"] * stop_atr_pct
+        r_mult = (g / p["sh"]) / risk_per_share if risk_per_share > 0 and p["sh"] > 0 else 0
+        trades.append(Trade(
+            sym, p["dir"], p["et"], et, p["en"], ep, p["sh"],
+            g, c + p["ec"], n, p["bh"], reason, p.get("rvol", 0), r_mult
+        ))
+        equity += n
+        daily_pnl += n
+        del positions[sym]
+
+    for bi, ts in enumerate(all_ts):
+        bd = ts.date() if hasattr(ts, 'date') else pd.Timestamp(ts).date()
+
+        # ── New day ─────────────────────────────────────────
+        if bd != current_day:
+            # Close all open positions from previous day
+            for sym in list(positions.keys()):
+                lp = positions[sym]["en"]
+                for pt in reversed(all_ts[:bi]):
+                    if sym in minute_data and pt in minute_data[sym].index:
+                        lp = float(minute_data[sym].loc[pt, "close"])
+                        break
+                close_pos(sym, lp, ts, "eod_close")
+            current_day = bd
+            day_bar = 0
+            orb.clear()
+            rvol_today.clear()
+            daily_pnl = 0.0
+            disabled = False
+            traded_today.clear()   # FIX #3
+            pending_orders.clear() # FIX #2
+
+        day_bar += 1
+
+        # ── Process each symbol ─────────────────────────────
+        for sym in symbols:
+            if sym not in minute_data:
+                continue
+            df = minute_data[sym]
+            if ts not in df.index:
+                continue
+            r = df.loc[ts]
+            o = float(r["open"])
+            h = float(r["high"])
+            l = float(r["low"])
+            c = float(r["close"])
+            v = float(r["volume"])
+            atr = get_atr(sym, bd)
+
+            # ── Build ORB (bars 1-5) ────────────────────────
+            if day_bar <= ORB_BARS:
+                if sym not in orb:
+                    orb[sym] = {"hi": h, "lo": l, "op": o, "cl": c,
+                                "n": 1, "done": False, "v": v}
+                else:
+                    d = orb[sym]
+                    d["hi"] = max(d["hi"], h)
+                    d["lo"] = min(d["lo"], l)
+                    d["cl"] = c
+                    d["n"] += 1
+                    d["v"] += v
+
+                if day_bar == ORB_BARS and sym in orb:
+                    d = orb[sym]
+                    d["done"] = True
+                    d["bull"] = d["cl"] > d["op"]
+                    d["bear"] = d["cl"] < d["op"]
+                    d["doji"] = d["cl"] == d["op"]
+                    d["sz"] = d["hi"] - d["lo"]
+
+                    # Compute RVOL
+                    rv = get_rvol(opening_vols, sym, bd)
+                    rvol_today[sym] = rv
+
+                    # Check all filters and place pending stop orders
+                    if d["doji"]:
+                        rej["doji"] += 1
+                        continue
+
+                    if atr is None or atr < MIN_ATR:
+                        rej["atr_low"] += 1
+                        continue
+
+                    mid_price = (d["hi"] + d["lo"]) / 2
+                    if mid_price < MIN_PRICE:
+                        rej["price_low"] += 1
+                        continue
+
+                    # FIX #5: avg daily volume filter
+                    avg_dv = get_avg_daily_vol(daily_stats, sym, bd)
+                    if min_avg_daily_vol > 0 and avg_dv < min_avg_daily_vol:
+                        rej["avg_vol_low"] += 1
+                        continue
+
+                    # RVOL filter
+                    if rvol_threshold > 0 and (rv is None or rv < rvol_threshold):
+                        rej["rvol_low"] += 1
+                        continue
+
+                    # Place pending stop order (FIX #2)
+                    if d["bull"]:
+                        pending_orders[sym] = {
+                            "dir": "long",
+                            "trigger": d["hi"],  # stop buy at ORB high
+                            "atr": atr,
+                            "rvol": rv if rv else 0,
+                        }
+                    elif d["bear"]:
+                        pending_orders[sym] = {
+                            "dir": "short",
+                            "trigger": d["lo"],  # stop sell at ORB low
+                            "atr": atr,
+                            "rvol": rv if rv else 0,
+                        }
+
+                    if verbose and rv and rv >= rvol_threshold:
+                        print(f"  ORB: {sym} {bd} {d['lo']:.2f}-{d['hi']:.2f} "
+                              f"vol={d['v']:,.0f} RVOL={rv:.1f}x "
+                              f"{'BULL→buy@'+f'{d[\"hi\"]:.2f}' if d['bull'] else 'BEAR→sell@'+f'{d[\"lo\"]:.2f}'}"
+                              f" ATR=${atr:.2f} stop_dist=${atr*stop_atr_pct:.2f}")
+                continue
+
+            # ── Check pending stop orders (FIX #2) ──────────
+            if sym in pending_orders and sym not in positions and sym not in traded_today:
+                po = pending_orders[sym]
+                triggered = False
+                fill_price = po["trigger"]
+
+                if po["dir"] == "long" and h >= po["trigger"]:
+                    # Bar high reached our buy stop → filled at trigger price
+                    triggered = True
+                elif po["dir"] == "short" and l <= po["trigger"]:
+                    # Bar low reached our sell stop → filled at trigger price
+                    triggered = True
+
+                if triggered:
+                    if disabled:
+                        rej["daily_loss_limit"] += 1
+                        del pending_orders[sym]
+                        continue
+                    if len(positions) >= max_positions:
+                        rej["max_positions"] += 1
+                        # Don't delete order — might fill later when slot opens
+                        # Actually paper fills all at once, so skip
+                        continue
+
+                    direction = po["dir"]
+                    entry_price = fill_price
+                    atr_val = po["atr"]
+
+                    # Stop loss: 10% of ATR from entry (PAPER SPEC)
+                    stop_dist = atr_val * stop_atr_pct
+                    if direction == "long":
+                        stop_price = entry_price - stop_dist
+                    else:
+                        stop_price = entry_price + stop_dist
+
+                    risk_per_share = stop_dist
+                    if risk_per_share <= 0.001:
+                        rej["zero_risk"] += 1
+                        del pending_orders[sym]
+                        continue
+
+                    # Position sizing: 1% risk per trade
+                    sh = int(equity * RISK_PCT / risk_per_share)
+
+                    # Max leverage 4x (FIX #7)
+                    max_shares_leverage = int(equity * max_leverage / entry_price) if entry_price > 0 else 0
+
+                    # Equal-weight cap: don't exceed 1/max_positions of portfolio
+                    max_shares_weight = int(equity / max_positions / entry_price) if entry_price > 0 else 0
+
+                    sh = min(sh, max_shares_leverage, max_shares_weight)
+                    if sh <= 0:
+                        rej["cant_size"] += 1
+                        del pending_orders[sym]
+                        continue
+
+                    ec = calc_costs(entry_price, sh, slip)
+                    positions[sym] = {
+                        "sy": sym, "dir": direction,
+                        "en": entry_price, "sh": sh,
+                        "st": stop_price, "atr": atr_val,
+                        "ec": ec, "et": ts, "bh": 0,
+                        "rvol": po["rvol"],
+                    }
+                    traded_today.add(sym)  # FIX #3
+                    del pending_orders[sym]
+                    rej["ENTERED"] += 1
+
+                    if verbose and rej["ENTERED"] <= 50:
+                        print(f"  {'LONG' if direction == 'long' else 'SHORT'}: "
+                              f"{sym} {bd} bar={day_bar} ${entry_price:.2f} "
+                              f"stop=${stop_price:.2f} risk=${risk_per_share:.2f} "
+                              f"sh={sh} RVOL={po['rvol']:.1f}x")
+
+            # ── Exit logic ──────────────────────────────────
+            if sym in positions:
+                p = positions[sym]
+                p["bh"] += 1
+
+                # Stop loss check (use high/low of bar for realism)
+                if p["dir"] == "long" and l <= p["st"]:
+                    # Stopped out — fill at stop price (or worse if gap)
+                    exit_price = min(p["st"], o)  # gap-down: fill at open
+                    if l <= p["st"]:
+                        exit_price = p["st"]  # normal: fill at stop
+                    close_pos(sym, exit_price, ts, "stop_loss")
+                    continue
+                elif p["dir"] == "short" and h >= p["st"]:
+                    exit_price = max(p["st"], o)  # gap-up: fill at open
+                    if h >= p["st"]:
+                        exit_price = p["st"]  # normal: fill at stop
+                    close_pos(sym, exit_price, ts, "stop_loss")
+                    continue
+
+                # EOD flatten
+                if day_bar >= EOD_BAR:
+                    won = ((p["dir"] == "long" and c > p["en"]) or
+                           (p["dir"] == "short" and c < p["en"]))
+                    close_pos(sym, c, ts, "eod_win" if won else "eod_loss")
+                continue
+
+        # Daily loss limit check
+        if daily_pnl <= -(equity * 0.03):
+            disabled = True
+
+        # Mark-to-market
+        mtm = equity
+        for sym, p in positions.items():
+            if sym in minute_data and ts in minute_data[sym].index:
+                cp = float(minute_data[sym].loc[ts, "close"])
+                if p["dir"] == "long":
+                    mtm += (cp - p["en"]) * p["sh"]
+                else:
+                    mtm += (p["en"] - cp) * p["sh"]
+        eq_curve.append(mtm)
+
+    # Close remaining
+    for sym in list(positions.keys()):
+        lt = all_ts[-1]
+        ep = positions[sym]["en"]
+        if sym in minute_data and lt in minute_data[sym].index:
+            ep = float(minute_data[sym].loc[lt, "close"])
+        close_pos(sym, ep, lt, "backtest_end")
+
+    return trades, eq_curve, rej
+
+# ── Report ──────────────────────────────────────────────────────────
+
+def report(trades, eq, rej, cap, label):
+    print(f"\n{'=' * 70}")
+    print(f"  {label}")
+    print(f"{'=' * 70}")
+    if not trades:
+        print(f"  NO TRADES. Rejections:")
+        for r, c in rej.most_common(15):
+            print(f"    {r:<25} {c:>8}")
+        return
+
+    pnls = [t.net_pnl for t in trades]
+    w = [p for p in pnls if p > 0]
+    l = [p for p in pnls if p <= 0]
+    tot = sum(pnls)
+    cs = sum(t.costs for t in trades)
+    gr = sum(t.gross_pnl for t in trades)
+    wr = len(w) / len(pnls)
+    pf = sum(w) / abs(sum(l)) if l and sum(l) != 0 else float('inf')
+    e = np.array(eq)
+    pk = np.maximum.accumulate(e)
+    dd = (pk - e) / pk
+    mdd = float(np.max(dd)) * 100
+    rt = np.diff(e) / e[:-1]
+    sh = float(np.mean(rt) / np.std(rt) * np.sqrt(252 * 390)) if np.std(rt) > 0 else 0
+
+    long_t = [t for t in trades if t.direction == "long"]
+    short_t = [t for t in trades if t.direction == "short"]
+    long_w = len([t for t in long_t if t.net_pnl > 0])
+    short_w = len([t for t in short_t if t.net_pnl > 0])
+
+    # R-multiple stats
+    r_mults = [t.r_multiple for t in trades]
+    r_wins = [t.r_multiple for t in trades if t.r_multiple > 0]
+    r_losses = [t.r_multiple for t in trades if t.r_multiple <= 0]
+
+    print(f"\n  Net P&L: ${tot:,.2f} ({tot / cap * 100:.1f}%)")
+    print(f"  Gross P&L: ${gr:,.2f}  Costs: ${cs:,.2f}")
+    print(f"  Sharpe: {sh:.2f}  Profit Factor: {pf:.2f}")
+    print(f"  Trades: {len(trades)}  Win Rate: {wr * 100:.1f}%  ({len(w)}W / {len(l)}L)")
+    print(f"    Long: {len(long_t)} ({long_w}W)  Short: {len(short_t)} ({short_w}W)")
+    print(f"  Avg Win: ${np.mean(w) if w else 0:,.2f}  Avg Loss: ${np.mean(l) if l else 0:,.2f}")
+    print(f"  Max DD: {mdd:.2f}%  Avg Hold: {np.mean([t.hold_bars for t in trades]):.0f} bars")
+    print(f"  Avg RVOL on entry: {np.mean([t.rvol for t in trades]):.1f}x")
+    print(f"\n  R-Multiple Stats:")
+    print(f"    Avg R: {np.mean(r_mults):.2f}R  "
+          f"Avg Win: {np.mean(r_wins) if r_wins else 0:.2f}R  "
+          f"Avg Loss: {np.mean(r_losses) if r_losses else 0:.2f}R")
+    print(f"    Best: {max(r_mults):.1f}R  Worst: {min(r_mults):.1f}R  "
+          f"Expectancy: {np.mean(r_mults):.3f}R/trade")
+
+    print(f"\n  Exit Reasons:")
+    rc = Counter()
+    rp = Counter()
+    rr = {}  # avg R by reason
+    for t in trades:
+        rc[t.exit_reason] += 1
+        rp[t.exit_reason] += t.net_pnl
+        rr.setdefault(t.exit_reason, []).append(t.r_multiple)
+    for r in sorted(rc):
+        ww = len([t for t in trades if t.exit_reason == r and t.net_pnl > 0])
+        avg_r = np.mean(rr[r])
+        print(f"    {r:<22} {rc[r]:>3}  ${rp[r]:>10,.2f}  "
+              f"WR:{ww / rc[r] * 100 if rc[r] else 0:.0f}%  avgR:{avg_r:+.2f}")
+
+    print(f"\n  Trades (first 35):")
+    print(f"  {'Dir':<5}{'Sym':<6}{'Entry':>8}{'Exit':>8}{'Stop':>8}"
+          f"{'Sh':>7}{'Gross':>9}{'Net':>9}{'Bars':>5}{'R':>6}{'RV':>5} Reason")
+    for t in trades[:35]:
+        # Reconstruct stop from entry and ATR
+        print(f"  {t.direction:<5}{t.symbol:<6}${t.entry_price:>7.2f}${t.exit_price:>7.2f}"
+              f"{'':>8}{t.shares:>7}${t.gross_pnl:>8.2f}${t.net_pnl:>8.2f}"
+              f"{t.hold_bars:>5}{t.r_multiple:>+5.1f}R{t.rvol:>4.1f}x {t.exit_reason}")
+
+    print(f"\n  Rejections:")
+    for r, c in rej.most_common(15):
+        print(f"    {r:<25} {c:>8}")
+    print(f"{'=' * 70}")
+
+# ── Main ────────────────────────────────────────────────────────────
+
+def main():
+    from alpaca.data.timeframe import TimeFrame
+
+    print("=" * 70)
+    print("  ORB V4.1 — Corrected Paper-Match (Zarattini/Barbon/Aziz 2024)")
+    print("  Stop=0.10×ATR | Entry@ORBhi/lo | 1/stock/day | AvgVol>1M")
+    print("=" * 70)
+
+    client = get_alpaca_client()
+    if client is None:
+        print("No Alpaca keys found. Exiting.")
+        return
+
+    # EXPANDED UNIVERSE: 50 liquid US stocks (FIX #6)
+    # Mix of high-vol tech, financials, energy, biotech, retail
+    # Paper uses top 1000 most liquid → we approximate with high-vol names
+    syms = [
+        # Original 15
+        "MARA", "MSTR", "RIOT", "COIN", "HOOD", "SMCI", "SOFI", "AFRM",
+        "ENPH", "PLTR", "TSLA", "NVDA", "AMD", "SNAP", "ROKU",
+        # Additional high-volume stocks (paper top performers + liquid names)
+        "AAPL", "AMZN", "META", "GOOG", "MSFT",  # mega caps
+        "NFLX", "SQ", "SHOP", "UBER", "LYFT",     # tech growth
+        "BA", "F", "GM", "NIO", "RIVN",            # industrials/EV
+        "JPM", "BAC", "GS", "C", "WFC",            # financials
+        "XOM", "CVX", "OXY", "SLB",                # energy
+        "PFE", "MRNA", "ABBV",                     # pharma
+        "WMT", "TGT", "COST",                      # retail
+        "DIS", "PYPL", "INTC", "MU", "QCOM",      # other tech
+        "FSLR", "W", "ADBE", "CRM",               # paper top performers
+    ]
+    # Deduplicate
+    syms = list(dict.fromkeys(syms))
+
+    # ── Daily bars ──────────────────────────────────────────────────
+    print(f"\nFetching daily bars (SIP) for {len(syms)} symbols...")
+    dstats = {}
+    for s in syms:
+        print(f"  {s}...", end=" ", flush=True)
+        df = None
+        try:
+            df = fetch_alpaca(client, s, 90, TimeFrame.Day, feed="sip")
+        except Exception as e:
+            print(f"SIP fail ({e}), IEX...", end=" ")
+            try:
+                df = fetch_alpaca(client, s, 90, TimeFrame.Day, feed="iex")
+            except:
+                pass
+        if df is not None and len(df) >= 15:
+            df["atr"] = daily_atr_series(df, 14)
+            dstats[s] = df
+            a = [x for x in df["atr"] if x]
+            v = df["volume"].mean()
+            print(f"ATR=${a[-1]:.2f} avgVol={v:,.0f}" if a else "ok")
+        else:
+            print("skip")
+
+    # ── Minute bars ─────────────────────────────────────────────────
+    print(f"\nFetching minute bars (SIP) for {len(syms)} symbols...")
+    mdata = {}
+    for s in syms:
+        print(f"  {s}...", end=" ", flush=True)
+        df = None
+        try:
+            df = fetch_alpaca(client, s, 60, TimeFrame.Minute, feed="sip")
+        except Exception as e:
+            print(f"SIP fail ({e}), IEX...", end=" ")
+            try:
+                df = fetch_alpaca(client, s, 60, TimeFrame.Minute, feed="iex")
+            except:
+                pass
+        if df is not None and len(df) > 100:
+            mdata[s] = df
+            first_day = df.index[0].date()
+            day1 = df[df.index.date == first_day]
+            print(f"{len(df)} bars")
+        else:
+            print("skip")
+
+    act = [s for s in syms if s in mdata and s in dstats]
+    print(f"\nActive: {len(act)} of {len(syms)}")
+    if not act:
+        print("No symbols. Exiting.")
+        return
+
+    # ── RVOL history ────────────────────────────────────────────────
+    print("\nBuilding opening volume history for RVOL...")
+    opening_vols = build_opening_vol_history(mdata, orb_bars=5)
+    for s in act[:5]:
+        hist = opening_vols.get(s, {})
+        vals = list(hist.values())
+        if vals:
+            print(f"  {s}: {len(vals)} days, avg_5min_vol={np.mean(vals):,.0f}")
+
+    # ── Avg daily volume check ──────────────────────────────────────
+    print("\nAvg daily volume check (need >= 1M):")
+    qualified = 0
+    for s in act[:10]:
+        ds = dstats.get(s)
+        if ds is not None:
+            avg_v = ds["volume"].mean()
+            qual = "✓" if avg_v >= 1_000_000 else "✗"
+            if avg_v >= 1_000_000:
+                qualified += 1
+            print(f"  {s}: avg_daily_vol={avg_v:,.0f} {qual}")
+
+    # ── Tests ───────────────────────────────────────────────────────
+
+    # Test 1: Paper-faithful (stop=0.10×ATR, RVOL>=2x, AvgVol>1M)
+    print("\n" + "=" * 70)
+    print("  TEST 1: Paper-matched (stop=0.10×ATR, RVOL>=2x, vol>1M, lev=4x)")
+    print("=" * 70)
+    t1, e1, r1 = run(mdata, dstats, opening_vols, act,
+                      capital=100000, verbose=True,
+                      rvol_threshold=2.0, max_positions=20,
+                      stop_atr_pct=0.10, max_leverage=4.0,
+                      min_avg_daily_vol=1_000_000)
+    report(t1, e1, r1, 100000, "TEST 1: Paper-matched")
+
+    # Test 2: RVOL>=1.5x (relaxed — our universe is smaller than paper's 1000)
+    print("\n" + "=" * 70)
+    print("  TEST 2: Relaxed RVOL>=1.5x")
+    print("=" * 70)
+    t2, e2, r2 = run(mdata, dstats, opening_vols, act,
+                      capital=100000,
+                      rvol_threshold=1.5, max_positions=20,
+                      stop_atr_pct=0.10, max_leverage=4.0,
+                      min_avg_daily_vol=1_000_000)
+    report(t2, e2, r2, 100000, "TEST 2: RVOL>=1.5x")
+
+    # Test 3: No RVOL filter (isolate stop fix impact)
+    print("\n" + "=" * 70)
+    print("  TEST 3: No RVOL (isolate mechanical fixes)")
+    print("=" * 70)
+    t3, e3, r3 = run(mdata, dstats, opening_vols, act,
+                      capital=100000,
+                      rvol_threshold=0.0, max_positions=20,
+                      stop_atr_pct=0.10, max_leverage=4.0,
+                      min_avg_daily_vol=1_000_000)
+    report(t3, e3, r3, 100000, "TEST 3: No RVOL")
+
+    # Test 4: $1K account, paper-matched
+    print("\n" + "=" * 70)
+    print("  TEST 4: $1K, paper-matched")
+    print("=" * 70)
+    t4, e4, r4 = run(mdata, dstats, opening_vols, act,
+                      capital=1000,
+                      rvol_threshold=2.0, max_positions=20,
+                      stop_atr_pct=0.10, max_leverage=4.0,
+                      min_avg_daily_vol=1_000_000)
+    report(t4, e4, r4, 1000, "TEST 4: $1K paper-matched")
+
+    # Test 5: Wider stop 0.20×ATR (sensitivity test)
+    print("\n" + "=" * 70)
+    print("  TEST 5: Wider stop 0.20×ATR (sensitivity)")
+    print("=" * 70)
+    t5, e5, r5 = run(mdata, dstats, opening_vols, act,
+                      capital=100000,
+                      rvol_threshold=2.0, max_positions=20,
+                      stop_atr_pct=0.20, max_leverage=4.0,
+                      min_avg_daily_vol=1_000_000)
+    report(t5, e5, r5, 100000, "TEST 5: Stop 0.20×ATR")
+
+    # Save trades
+    for name, tl in [("v41_paper", t1), ("v41_relaxed", t2), ("v41_norvol", t3)]:
+        if tl:
+            os.makedirs("logs", exist_ok=True)
+            rows = [{
+                "sym": t.symbol, "dir": t.direction,
+                "entry_time": t.entry_time, "exit_time": t.exit_time,
+                "entry": t.entry_price, "exit": t.exit_price,
+                "shares": t.shares, "gross": t.gross_pnl, "net": t.net_pnl,
+                "bars": t.hold_bars, "rvol": t.rvol, "r_mult": t.r_multiple,
+                "reason": t.exit_reason
+            } for t in tl]
+            pd.DataFrame(rows).to_csv(f"logs/backtest_{name}_trades.csv", index=False)
+            print(f"  Saved logs/backtest_{name}_trades.csv")
+
+    # ── Summary ─────────────────────────────────────────────────────
+    print(f"\n{'=' * 70}")
+    print(f"  SUMMARY — V4.1 vs V4.0 vs V3.5")
+    print(f"{'=' * 70}")
+    for nm, tl, cp in [
+        ("Paper-match", t1, 100000),
+        ("RVOL>=1.5x", t2, 100000),
+        ("No RVOL", t3, 100000),
+        ("$1K paper", t4, 1000),
+        ("Stop=0.20×ATR", t5, 100000),
+    ]:
+        n = len(tl)
+        p = sum(t.net_pnl for t in tl)
+        w = len([t for t in tl if t.net_pnl > 0]) / n * 100 if n else 0
+        avgr = np.mean([t.r_multiple for t in tl]) if tl else 0
+        longs = len([t for t in tl if t.direction == "long"])
+        shorts = len([t for t in tl if t.direction == "short"])
+        print(f"  {nm:<15} {n:>4} trades  ${p:>10,.2f}  "
+              f"WR:{w:>5.1f}%  avgR:{avgr:>+.2f}  L:{longs} S:{shorts}")
+
+    print(f"\n  V4.0 baseline: 34 trades, $-6,371, WR:8.8%, Sharpe:-1.71")
+    print(f"  V3.5 baseline: 43 trades, $-4,902, WR:27.9%, PF:0.79")
+    print(f"\n  V4.1 fixes applied:")
+    print(f"    1. Stop: 0.10×ATR from entry (was ORB low — inverted R:R)")
+    print(f"    2. Entry: at ORB hi/lo exact (was bar close — late fill)")
+    print(f"    3. One trade/stock/day (was unlimited — multiplied losses)")
+    print(f"    4. VWAP removed (not in paper — filtered valid setups)")
+    print(f"    5. AvgDailyVol >= 1M (was missing — allowed illiquid)")
+    print(f"    6. Universe: {len(act)} stocks (was 15 — too small)")
+    print(f"    7. Max leverage: 4x (was 0.95x — limited sizing)")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,710 @@
+"""
+V3.0 Strategy: Opening Range Breakout + VWAP Momentum
+======================================================
+Based on Zarattini, Barbon & Aziz (2024) - Swiss Finance Institute
+"A Profitable Day Trading Strategy For The U.S. Equity Market"
+
+Key findings from the paper:
+- 5-minute ORB on "Stocks in Play" = 2.81 Sharpe, 36% annualized alpha
+- Stock selection matters more than entry timing
+- Relative volume (RVOL) is the single best filter
+- ATR-based stops at 10% of 14-day ATR
+- All positions closed end-of-day
+
+Our adaptations for a $1K cash account:
+- Long-only (no shorting on cash account)
+- 1% risk per trade ($10 max loss)
+- VWAP confirmation filter (price must be above VWAP for longs)
+- ATR trailing stop for better R:R (minimum 2:1)
+- Volume confirmation on breakout bar
+- Max 1 position at a time (cash account settlement)
+"""
+import numpy as np
+from decimal import Decimal
+from typing import Tuple, Dict, List, Optional
+from dataclasses import dataclass, field
+
+from config.settings import AppConfig, TradeSignal
+from utils.logger import StructuredLogger
+
+
+# ── Indicators ──────────────────────────────────────────────────────
+
+class Indicators:
+    """Pure calculation functions. No state, no side effects."""
+
+    @staticmethod
+    def vwap(prices, volumes):
+        """Volume-Weighted Average Price."""
+        p = np.array(prices, dtype=float)
+        v = np.array(volumes, dtype=float)
+        if len(p) == 0 or v.sum() == 0:
+            return None
+        return float(np.sum(p * v) / np.sum(v))
+
+    @staticmethod
+    def atr(highs, lows, closes, period=14):
+        """Average True Range - primary volatility measure."""
+        h = np.array(highs, dtype=float)
+        l = np.array(lows, dtype=float)
+        c = np.array(closes, dtype=float)
+        if len(h) < period + 1:
+            return None
+        tr = np.maximum(
+            h[1:] - l[1:],
+            np.maximum(
+                np.abs(h[1:] - c[:-1]),
+                np.abs(l[1:] - c[:-1])
+            )
+        )
+        return float(np.mean(tr[-period:]))
+
+    @staticmethod
+    def rsi(prices, period=14):
+        """Relative Strength Index."""
+        p = np.array(prices, dtype=float)
+        if len(p) < period + 1:
+            return None
+        deltas = np.diff(p)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains[:period])
+        avg_loss = np.mean(losses[:period])
+        if avg_loss == 0:
+            return 100.0
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return float(100 - (100 / (1 + rs)))
+
+    @staticmethod
+    def ema(prices, period):
+        """Exponential Moving Average."""
+        p = np.array(prices, dtype=float)
+        if len(p) < period:
+            return None
+        mult = 2 / (period + 1)
+        val = np.mean(p[:period])
+        for price in p[period:]:
+            val = (price - val) * mult + val
+        return float(val)
+
+    @staticmethod
+    def slope(values, window=10):
+        """Linear regression slope (trend direction)."""
+        v = np.array(values, dtype=float)
+        if len(v) < window:
+            return 0.0
+        y = v[-window:]
+        x = np.arange(window)
+        return float(np.polyfit(x, y, 1)[0])
+
+    @staticmethod
+    def relative_volume(current_vol, avg_vol):
+        """How much higher is current volume vs average."""
+        if avg_vol is None or avg_vol <= 0:
+            return 0.0
+        return current_vol / avg_vol
+
+    @staticmethod
+    def avg_volume(volumes, window):
+        """Average volume over window."""
+        v = np.array(volumes, dtype=float)
+        if len(v) < window:
+            return None
+        return float(np.mean(v[-window:]))
+
+    @staticmethod
+    def rolling_std(values, window):
+        """Rolling standard deviation."""
+        v = np.array(values, dtype=float)
+        if len(v) < window:
+            return None
+        return float(np.std(v[-window:]))
+
+
+# ── Opening Range Tracker ───────────────────────────────────────────
+
+@dataclass
+class OpeningRange:
+    """Tracks the high/low of the first N minutes after market open."""
+    symbol: str
+    range_high: float = 0.0
+    range_low: float = float('inf')
+    range_close: float = 0.0      # Close of the opening range period
+    range_open: float = 0.0       # Open of the first bar
+    range_volume: float = 0.0     # Total volume during range
+    is_bullish: bool = False      # Did range close above open?
+    is_complete: bool = False     # Have we finished the range period?
+    bars_counted: int = 0
+    range_size: float = 0.0       # High - Low
+    range_size_pct: float = 0.0   # Range as % of price
+
+
+# ── Position Tracker ────────────────────────────────────────────────
+
+@dataclass
+class PositionState:
+    """Track everything about an open position for exit logic."""
+    symbol: str
+    entry_price: float
+    entry_time: int = 0           # Bar index
+    entry_atr: float = 0.0
+    initial_stop: float = 0.0     # Hard stop (doesn't move up)
+    trailing_stop: float = 0.0    # Moves up as price increases
+    profit_target: float = 0.0    # 2:1 R:R target
+    highest_since_entry: float = 0.0
+    bars_held: int = 0
+    breakeven_activated: bool = False
+    trailing_activated: bool = False
+
+
+# ── Main Strategy ───────────────────────────────────────────────────
+
+class ORBMomentumStrategy:
+    """
+    Opening Range Breakout + VWAP Momentum Strategy V3.0
+
+    PHASE 1: Stock Selection (pre-market / first bars)
+    - Relative volume > 2x average (Stock in Play)
+    - Price > $5, ATR > $0.50
+    - Gap from previous close > 2% (shows catalyst)
+
+    PHASE 2: Opening Range (first 5 bars = 5 minutes)
+    - Record high/low of first 5 one-minute bars
+    - Determine direction: bullish candle = look for long breakout
+
+    PHASE 3: Entry Confirmation
+    - Price breaks above opening range high
+    - Confirming bar closes above the high (not just a wick)
+    - Price is above VWAP (institutional buying pressure)
+    - Volume on breakout bar > 1.5x average
+
+    PHASE 4: Exit Logic
+    - Hard stop: entry - (0.10 * 14-day ATR) per Zarattini paper
+    - Trailing stop: 1.5 ATR from highest price (activated after 1 ATR profit)
+    - Profit target: 2x initial risk (minimum 2:1 R:R)
+    - Time stop: 60 bars (1 hour) if not profitable
+    - Breakeven stop: move to entry + $0.01 after 1.5x risk profit
+    - EOD flatten: close by 3:50 PM
+
+    PHASE 5: Position Sizing
+    - Risk 1% of account per trade
+    - Shares = risk_dollars / (entry - stop)
+    - Max 1 position at a time
+    """
+
+    # Configuration
+    OPENING_RANGE_BARS = 5          # 5-minute opening range
+    MIN_RELATIVE_VOLUME = 2.0       # Stock must have 2x normal volume
+    MIN_GAP_PCT = 0.02              # 2% gap from previous close
+    MIN_PRICE = 5.0                 # No penny stocks
+    MIN_ATR = 0.50                  # Minimum volatility
+    MIN_AVG_VOLUME = 500_000        # Minimum daily shares traded
+
+    BREAKOUT_VOLUME_RATIO = 1.5     # Breakout bar must have 1.5x avg volume
+    ATR_STOP_MULTIPLIER = 0.10      # Stop = 10% of 14-day ATR (per paper)
+    TRAILING_ATR_MULTIPLIER = 1.5   # Trailing stop distance
+    PROFIT_TARGET_RR = 2.0          # Minimum 2:1 reward-to-risk
+    TRAILING_ACTIVATION_ATR = 1.0   # Activate trailing after 1 ATR profit
+    BREAKEVEN_ACTIVATION_RR = 1.5   # Move to breakeven at 1.5x risk
+    TIME_STOP_BARS = 60             # Exit if not profitable within 60 bars
+    MAX_ENTRY_BAR = 60              # Don't enter after bar 60 (10:30 AM)
+    NO_ENTRY_LAST_BARS = 30         # Don't enter in last 30 bars of day
+
+    # Risk
+    RISK_PER_TRADE_PCT = 0.01       # 1% of account
+    MAX_POSITIONS = 1               # Cash account: 1 at a time
+
+    def __init__(self, config: AppConfig, logger: StructuredLogger):
+        self.config = config
+        self.log = logger
+        self.indicators = Indicators()
+
+        # State per symbol
+        self.symbol_data: Dict[str, dict] = {}       # Indicator values
+        self.opening_ranges: Dict[str, OpeningRange] = {}
+        self.positions: Dict[str, PositionState] = {}
+        self.previous_closes: Dict[str, float] = {}  # For gap calc
+
+        # Day-level state
+        self.day_bar_count: int = 0
+        self.bars_in_day: int = 390
+        self.current_day = None
+        self.active_position_count: int = 0
+
+        self.log.log_system("Strategy initialized",
+                            type="ORB_Momentum_V3",
+                            opening_range_bars=self.OPENING_RANGE_BARS,
+                            min_rvol=self.MIN_RELATIVE_VOLUME,
+                            rr_target=self.PROFIT_TARGET_RR)
+
+    # ── Day Management ──────────────────────────────────────────────
+
+    def new_day(self, day_date):
+        """Reset for a new trading day."""
+        # Save previous closes for gap calculation
+        for sym, data in self.symbol_data.items():
+            if "current_price" in data and data["current_price"] > 0:
+                self.previous_closes[sym] = data["current_price"]
+
+        self.opening_ranges.clear()
+        self.day_bar_count = 0
+        self.current_day = day_date
+
+    def increment_bar(self):
+        """Called each bar to track intraday progress."""
+        self.day_bar_count += 1
+
+        # Update bars_held for open positions
+        for sym, pos in self.positions.items():
+            pos.bars_held += 1
+
+    # ── Stock Selection (Phase 1) ───────────────────────────────────
+
+    def is_stock_in_play(self, symbol: str) -> Tuple[bool, str]:
+        """
+        Check if a stock qualifies as a "Stock in Play" today.
+        Based on Zarattini criteria: high relative volume + catalyst.
+        """
+        if symbol not in self.symbol_data:
+            return False, "no_data"
+
+        data = self.symbol_data[symbol]
+        price = data.get("current_price", 0)
+        atr = data.get("atr", 0)
+        avg_vol = data.get("avg_volume_daily", 0)
+        rel_vol = data.get("relative_volume", 0)
+
+        # Price filter
+        if price < self.MIN_PRICE:
+            return False, f"price_too_low:{price:.2f}"
+
+        # ATR filter
+        if atr is None or atr < self.MIN_ATR:
+            return False, f"atr_too_low:{atr}"
+
+        # Volume filter
+        if avg_vol is None or avg_vol < self.MIN_AVG_VOLUME:
+            return False, f"avg_vol_low:{avg_vol}"
+
+        # Relative volume (the key filter from the paper)
+        if rel_vol < self.MIN_RELATIVE_VOLUME:
+            return False, f"rvol_low:{rel_vol:.1f}"
+
+        # Gap filter (shows catalyst/news driving the stock)
+        prev_close = self.previous_closes.get(symbol, 0)
+        if prev_close > 0:
+            gap_pct = (price - prev_close) / prev_close
+            if abs(gap_pct) < self.MIN_GAP_PCT:
+                return False, f"gap_too_small:{gap_pct:.3f}"
+
+        return True, "in_play"
+
+    # ── Opening Range (Phase 2) ─────────────────────────────────────
+
+    def update_opening_range(self, symbol: str, high: float, low: float,
+                              open_price: float, close: float, volume: float):
+        """
+        Build the opening range from the first N bars of the day.
+        """
+        if symbol not in self.opening_ranges:
+            self.opening_ranges[symbol] = OpeningRange(
+                symbol=symbol,
+                range_open=open_price,
+                range_high=high,
+                range_low=low,
+            )
+
+        orb = self.opening_ranges[symbol]
+
+        if orb.is_complete:
+            return
+
+        # Update range extremes
+        orb.range_high = max(orb.range_high, high)
+        orb.range_low = min(orb.range_low, low)
+        orb.range_volume += volume
+        orb.bars_counted += 1
+        orb.range_close = close
+
+        # Check if opening range is complete
+        if orb.bars_counted >= self.OPENING_RANGE_BARS:
+            orb.is_complete = True
+            orb.is_bullish = (orb.range_close > orb.range_open)
+            orb.range_size = orb.range_high - orb.range_low
+            if orb.range_high > 0:
+                orb.range_size_pct = orb.range_size / orb.range_high
+
+    # ── Data Update ─────────────────────────────────────────────────
+
+    def update_bars(self, symbol: str, closes: list, highs: list,
+                     lows: list, volumes: list,
+                     opens: list = None, vwaps: list = None):
+        """
+        Feed new bar data. Calculates all indicators.
+        """
+        if len(closes) < 20:
+            return
+
+        price = float(closes[-1])
+        lb = min(20, len(closes))
+
+        # VWAP from typical prices
+        typical = [(h + l + c) / 3 for h, l, c in
+                   zip(highs[-lb:], lows[-lb:], closes[-lb:])]
+        vwap = self.indicators.vwap(typical, volumes[-lb:])
+
+        # If we have real VWAP data, prefer it
+        if vwaps and len(vwaps) > 0 and vwaps[-1] > 0:
+            vwap = float(vwaps[-1])
+
+        # Core indicators
+        atr = self.indicators.atr(highs, lows, closes, 14)
+        rsi = self.indicators.rsi(closes, 14)
+        avg_vol = self.indicators.avg_volume(volumes, 20)
+        cur_vol = float(volumes[-1]) if volumes else 0
+        rel_vol = self.indicators.relative_volume(cur_vol, avg_vol)
+
+        # Trend indicators
+        ema_20 = self.indicators.ema(closes, min(20, len(closes)))
+        price_slope = self.indicators.slope(closes, min(20, len(closes)))
+
+        # Standard deviation for z-score
+        std = self.indicators.rolling_std(typical, lb)
+        zscore = (price - vwap) / std if vwap and std and std > 0 else 0.0
+
+        # Daily average volume (for stock-in-play check)
+        # Approximate from intraday: avg bar vol * 390
+        avg_vol_daily = avg_vol * 390 if avg_vol else 0
+
+        self.symbol_data[symbol] = {
+            "current_price": price,
+            "vwap": vwap,
+            "atr": atr,
+            "rsi": rsi,
+            "avg_volume": avg_vol,
+            "relative_volume": rel_vol,
+            "ema_20": ema_20,
+            "price_slope": price_slope,
+            "zscore": zscore,
+            "std": std,
+            "avg_volume_daily": avg_vol_daily,
+        }
+
+        # Update trailing high for open positions
+        if symbol in self.positions:
+            pos = self.positions[symbol]
+            if price > pos.highest_since_entry:
+                pos.highest_since_entry = price
+                # Update trailing stop
+                if pos.trailing_activated and atr and atr > 0:
+                    new_trail = price - (self.TRAILING_ATR_MULTIPLIER * atr)
+                    pos.trailing_stop = max(pos.trailing_stop, new_trail)
+
+    # ── Signal Generation ───────────────────────────────────────────
+
+    def generate_signal(self, symbol: str, has_position: bool,
+                         current_bar: int = 0) -> Tuple[TradeSignal, dict]:
+        """
+        Generate trading signal. Default is NO_TRADE.
+
+        For backtester compatibility, accepts current_bar parameter.
+        """
+        if symbol not in self.symbol_data:
+            return TradeSignal.NO_TRADE, {"reason": "no_data"}
+
+        data = self.symbol_data[symbol]
+        price = data["current_price"]
+        vwap = data["vwap"]
+        atr = data["atr"]
+        rsi = data["rsi"]
+        rel_vol = data["relative_volume"]
+
+        meta = {
+            "price": round(price, 2),
+            "vwap": round(vwap, 2) if vwap else None,
+            "atr": round(atr, 4) if atr else None,
+            "rsi": round(rsi, 1) if rsi else None,
+            "rvol": round(rel_vol, 2),
+            "day_bar": self.day_bar_count,
+        }
+
+        # ── EXIT LOGIC (always check first) ─────────────────────────
+        if has_position and symbol in self.positions:
+            return self._check_exits(symbol, data, meta)
+
+        # ── ENTRY LOGIC ─────────────────────────────────────────────
+        return self._check_entry(symbol, data, meta, current_bar)
+
+    def _check_exits(self, symbol: str, data: dict,
+                      meta: dict) -> Tuple[TradeSignal, dict]:
+        """Check all exit conditions for an open position."""
+        pos = self.positions[symbol]
+        price = data["current_price"]
+        atr = data["atr"]
+
+        meta["entry_price"] = round(pos.entry_price, 2)
+        meta["bars_held"] = pos.bars_held
+        meta["highest"] = round(pos.highest_since_entry, 2)
+        meta["pnl_pct"] = round((price - pos.entry_price) / pos.entry_price * 100, 2)
+
+        # 1. HARD STOP (never moves, set at entry)
+        if price <= pos.initial_stop:
+            meta["reason"] = "hard_stop"
+            meta["stop_price"] = round(pos.initial_stop, 2)
+            self.log.log_signal(symbol, "EXIT:hard_stop", **meta)
+            del self.positions[symbol]
+            return TradeSignal.LONG_EXIT, meta
+
+        # 2. TRAILING STOP (activated after sufficient profit)
+        if pos.trailing_activated and price <= pos.trailing_stop:
+            meta["reason"] = "trailing_stop"
+            meta["trail_stop"] = round(pos.trailing_stop, 2)
+            self.log.log_signal(symbol, "EXIT:trailing_stop", **meta)
+            del self.positions[symbol]
+            return TradeSignal.LONG_EXIT, meta
+
+        # 3. PROFIT TARGET (2:1 R:R)
+        if price >= pos.profit_target:
+            meta["reason"] = "profit_target"
+            meta["target"] = round(pos.profit_target, 2)
+            self.log.log_signal(symbol, "EXIT:profit_target", **meta)
+            del self.positions[symbol]
+            return TradeSignal.LONG_EXIT, meta
+
+        # 4. TIME STOP (not profitable after 60 bars)
+        if pos.bars_held >= self.TIME_STOP_BARS:
+            if price <= pos.entry_price:
+                meta["reason"] = "time_stop"
+                self.log.log_signal(symbol, "EXIT:time_stop", **meta)
+                del self.positions[symbol]
+                return TradeSignal.LONG_EXIT, meta
+
+        # 5. BREAKEVEN ACTIVATION (move stop to entry after 1.5x risk)
+        if not pos.breakeven_activated:
+            risk = pos.entry_price - pos.initial_stop
+            if price >= pos.entry_price + (self.BREAKEVEN_ACTIVATION_RR * risk):
+                pos.breakeven_activated = True
+                pos.initial_stop = pos.entry_price + 0.01
+                meta["breakeven_activated"] = True
+
+        # 6. TRAILING STOP ACTIVATION (after 1 ATR profit)
+        if not pos.trailing_activated and atr and atr > 0:
+            if price >= pos.entry_price + (self.TRAILING_ACTIVATION_ATR * atr):
+                pos.trailing_activated = True
+                pos.trailing_stop = price - (self.TRAILING_ATR_MULTIPLIER * atr)
+                meta["trailing_activated"] = True
+
+        # 7. EOD FLATTEN (last 30 bars of day)
+        if self.day_bar_count >= (self.bars_in_day - self.NO_ENTRY_LAST_BARS):
+            meta["reason"] = "eod_flatten"
+            self.log.log_signal(symbol, "EXIT:eod_flatten", **meta)
+            del self.positions[symbol]
+            return TradeSignal.LONG_EXIT, meta
+
+        return TradeSignal.NO_TRADE, {"reason": "holding"}
+
+    def _check_entry(self, symbol: str, data: dict,
+                      meta: dict, current_bar: int) -> Tuple[TradeSignal, dict]:
+        """Check all entry conditions."""
+        price = data["current_price"]
+        vwap = data["vwap"]
+        atr = data["atr"]
+        rel_vol = data["relative_volume"]
+
+        # Don't enter if we already have max positions
+        if len(self.positions) >= self.MAX_POSITIONS:
+            return TradeSignal.NO_TRADE, {"reason": "max_positions"}
+
+        # Don't enter too late in the day
+        if self.day_bar_count > self.MAX_ENTRY_BAR:
+            return TradeSignal.NO_TRADE, {"reason": "too_late_in_day"}
+
+        # Don't enter too close to EOD
+        if self.day_bar_count >= (self.bars_in_day - self.NO_ENTRY_LAST_BARS):
+            return TradeSignal.NO_TRADE, {"reason": "near_eod"}
+
+        # Must have ATR for position sizing
+        if atr is None or atr <= 0:
+            return TradeSignal.NO_TRADE, {"reason": "no_atr"}
+
+        # Opening range must be complete
+        if symbol not in self.opening_ranges:
+            return TradeSignal.NO_TRADE, {"reason": "no_opening_range"}
+
+        orb = self.opening_ranges[symbol]
+        if not orb.is_complete:
+            return TradeSignal.NO_TRADE, {"reason": "range_building"}
+
+        # ── PHASE 1: Stock in Play check ────────────────────────────
+        in_play, play_reason = self.is_stock_in_play(symbol)
+        if not in_play:
+            return TradeSignal.NO_TRADE, {"reason": f"not_in_play:{play_reason}"}
+
+        # ── PHASE 2: Direction filter ───────────────────────────────
+        # Only take longs on bullish opening ranges (long-only account)
+        if not orb.is_bullish:
+            return TradeSignal.NO_TRADE, {"reason": "bearish_opening_range"}
+
+        # ── PHASE 3: Breakout confirmation ──────────────────────────
+        # Price must be above the opening range high
+        if price <= orb.range_high:
+            return TradeSignal.NO_TRADE, {"reason": "no_breakout"}
+
+        # Price must be above VWAP (institutional flow confirms)
+        if vwap and price < vwap:
+            return TradeSignal.NO_TRADE, {
+                "reason": f"below_vwap:{price:.2f}<{vwap:.2f}"
+            }
+
+        # Volume on breakout must confirm (1.5x average)
+        if rel_vol < self.BREAKOUT_VOLUME_RATIO:
+            return TradeSignal.NO_TRADE, {
+                "reason": f"weak_volume:{rel_vol:.1f}"
+            }
+
+        # Range size filter: don't trade if range is too large
+        # (indicates uncertainty, not a clean breakout)
+        if orb.range_size_pct > 0.05:  # Range > 5% of price
+            return TradeSignal.NO_TRADE, {
+                "reason": f"range_too_wide:{orb.range_size_pct:.3f}"
+            }
+
+        # Range too tiny = noise
+        if orb.range_size_pct < 0.002:  # Range < 0.2%
+            return TradeSignal.NO_TRADE, {
+                "reason": f"range_too_narrow:{orb.range_size_pct:.4f}"
+            }
+
+        # ── PHASE 4: Calculate stops and targets ────────────────────
+        # Stop loss: 10% of 14-day ATR below entry (per Zarattini paper)
+        stop_distance = self.ATR_STOP_MULTIPLIER * atr
+        initial_stop = price - stop_distance
+
+        # Ensure minimum risk makes sense
+        if stop_distance <= 0 or initial_stop <= 0:
+            return TradeSignal.NO_TRADE, {"reason": "invalid_stop"}
+
+        # Profit target: 2x the risk
+        risk = price - initial_stop
+        profit_target = price + (self.PROFIT_TARGET_RR * risk)
+
+        # ── ALL CONDITIONS MET ──────────────────────────────────────
+        meta["reason"] = "breakout_confirmed"
+        meta["orb_high"] = round(orb.range_high, 2)
+        meta["orb_low"] = round(orb.range_low, 2)
+        meta["orb_range_pct"] = round(orb.range_size_pct * 100, 2)
+        meta["initial_stop"] = round(initial_stop, 2)
+        meta["profit_target"] = round(profit_target, 2)
+        meta["risk_per_share"] = round(risk, 4)
+        meta["reward_per_share"] = round(profit_target - price, 4)
+
+        # Store position state
+        self.positions[symbol] = PositionState(
+            symbol=symbol,
+            entry_price=price,
+            entry_time=current_bar,
+            entry_atr=atr,
+            initial_stop=initial_stop,
+            trailing_stop=initial_stop,  # Starts at hard stop
+            profit_target=profit_target,
+            highest_since_entry=price,
+        )
+
+        self.log.log_signal(symbol, "ENTRY:orb_breakout", **meta)
+        return TradeSignal.LONG_ENTRY, meta
+
+    # ── Position Sizing ─────────────────────────────────────────────
+
+    def calculate_position_size(self, symbol: str, account_equity: float,
+                                 entry_price: float) -> int:
+        """
+        Calculate shares based on 1% account risk.
+        Shares = (equity * risk_pct) / (entry - stop)
+        """
+        if symbol not in self.symbol_data:
+            return 0
+
+        data = self.symbol_data[symbol]
+        atr = data.get("atr", 0)
+        if not atr or atr <= 0:
+            return 0
+
+        stop_distance = self.ATR_STOP_MULTIPLIER * atr
+        if stop_distance <= 0:
+            return 0
+
+        risk_dollars = account_equity * self.RISK_PER_TRADE_PCT
+        shares = int(risk_dollars / stop_distance)
+
+        # Don't exceed buying power
+        max_shares = int(account_equity / entry_price)
+        shares = min(shares, max_shares)
+
+        return max(0, shares)
+
+    # ── Helper Methods ──────────────────────────────────────────────
+
+    def get_stop_price(self, symbol: str) -> Optional[Decimal]:
+        """Get the current stop price for a symbol."""
+        if symbol in self.positions:
+            pos = self.positions[symbol]
+            effective_stop = max(pos.initial_stop, pos.trailing_stop)
+            return Decimal(str(round(effective_stop, 2)))
+
+        if symbol in self.symbol_data:
+            data = self.symbol_data[symbol]
+            atr = data.get("atr", 0)
+            price = data.get("current_price", 0)
+            if atr and atr > 0 and price > 0:
+                stop = price - (self.ATR_STOP_MULTIPLIER * atr)
+                return max(Decimal(str(round(stop, 2))), Decimal("0.01"))
+
+        return None
+
+    def get_state(self, symbol: str) -> Optional[dict]:
+        """Get current indicator state for a symbol."""
+        return self.symbol_data.get(symbol)
+
+    def estimate_expected_value(self, entry_price, vwap, stop_price,
+                                 spread_cost, slippage_est,
+                                 win_rate=0.45):
+        """
+        Estimate expected value per share.
+        Using 45% base win rate (conservative for ORB).
+        """
+        entry = float(entry_price)
+        stop = float(stop_price)
+        spread = float(spread_cost)
+        slip = float(slippage_est)
+
+        if entry <= 0 or stop >= entry:
+            return Decimal("0"), {"reason": "invalid_prices"}
+
+        risk = entry - stop
+        reward = risk * self.PROFIT_TARGET_RR  # 2:1 R:R
+        total_cost = spread + slip
+
+        net_win = reward - total_cost
+        net_loss = risk + total_cost
+
+        ev = (win_rate * net_win) - ((1 - win_rate) * net_loss)
+
+        return Decimal(str(round(ev, 4))), {
+            "risk": round(risk, 4),
+            "reward": round(reward, 4),
+            "total_cost": round(total_cost, 4),
+            "ev_per_share": round(ev, 4),
+            "win_rate": win_rate,
+        }
+
+    def force_close(self, symbol: str):
+        """Remove position tracking for a symbol."""
+        self.positions.pop(symbol, None)
+
+    def has_open_position(self, symbol: str) -> bool:
+        return symbol in self.positions

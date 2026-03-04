@@ -1,0 +1,461 @@
+"""
+Broker Interface - Alpaca API wrapper with cash account enforcement.
+Every interaction with the broker goes through this layer.
+Enforces: T+2 settlement, rate limits, order validation, reconciliation.
+"""
+import time
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
+from typing import Optional, Dict, List, Tuple
+
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    MarketOrderRequest, LimitOrderRequest,
+    GetOrdersRequest, ClosePositionRequest
+)
+from alpaca.trading.enums import (
+    OrderSide, OrderType, TimeInForce, OrderStatus,
+    QueryOrderStatus
+)
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import (
+    StockBarsRequest, StockLatestQuoteRequest,
+    StockSnapshotRequest
+)
+from alpaca.data.timeframe import TimeFrame
+
+from config.settings import AppConfig, AccountType
+from utils.logger import StructuredLogger
+
+
+class RateLimiter:
+    """Enforces Alpaca API rate limits."""
+
+    def __init__(self, max_per_minute=200):
+        self.max_per_minute = max_per_minute
+        self.timestamps = deque()
+
+    def check(self):
+        now = time.monotonic()
+        while self.timestamps and now - self.timestamps[0] > 60:
+            self.timestamps.popleft()
+        return len(self.timestamps) < self.max_per_minute
+
+    def record(self):
+        self.timestamps.append(time.monotonic())
+
+    def wait_if_needed(self):
+        while not self.check():
+            time.sleep(0.5)
+        self.record()
+
+
+class BrokerInterface:
+    """
+    All Alpaca API interactions. Nothing else in the codebase
+    touches the broker directly.
+    """
+
+    def __init__(self, config: AppConfig, logger: StructuredLogger):
+        self.config = config
+        self.log = logger
+        self.rate_limiter = RateLimiter(config.account.max_orders_per_minute)
+
+        self.trading_client = TradingClient(
+            api_key=config.alpaca_api_key,
+            secret_key=config.alpaca_secret_key,
+            paper=config.account.environment.name == "PAPER"
+        )
+        self.data_client = StockHistoricalDataClient(
+            api_key=config.alpaca_api_key,
+            secret_key=config.alpaca_secret_key
+        )
+
+        self.log.log_system("Broker interface initialized",
+                            paper=config.account.environment.name == "PAPER")
+
+    # ── Account Info ───────────────────────────────────────────────────
+
+    def get_account(self):
+        self.rate_limiter.wait_if_needed()
+        try:
+            start = time.monotonic()
+            account = self.trading_client.get_account()
+            latency_ms = (time.monotonic() - start) * 1000
+
+            self.log.log_system("Account fetched",
+                                latency_ms=round(latency_ms, 1))
+
+            if latency_ms > self.config.monitoring.max_api_latency_ms:
+                self.log.warning("LATENCY",
+                                 "API latency exceeded threshold",
+                                 latency_ms=round(latency_ms, 1),
+                                 threshold=self.config.monitoring.max_api_latency_ms)
+            return account
+        except Exception as e:
+            self.log.error("BROKER", f"Failed to fetch account: {e}")
+            raise
+
+    def get_buying_power(self):
+        """
+        Get SETTLED buying power for cash account.
+        Uses cash field, NOT buying_power (which includes margin).
+        """
+        account = self.get_account()
+        if self.config.account.account_type == AccountType.CASH:
+            buying_power = Decimal(str(account.cash))
+            self.log.log_system("Buying power checked",
+                                buying_power=str(buying_power),
+                                account_type="CASH")
+            return buying_power
+        else:
+            return Decimal(str(account.buying_power))
+
+    def get_equity(self):
+        account = self.get_account()
+        return Decimal(str(account.equity))
+
+    # ── Positions ──────────────────────────────────────────────────────
+
+    def get_positions(self):
+        self.rate_limiter.wait_if_needed()
+        try:
+            positions = self.trading_client.get_all_positions()
+            self.log.log_system("Positions fetched",
+                                count=len(positions))
+            return positions
+        except Exception as e:
+            self.log.error("BROKER", f"Failed to fetch positions: {e}")
+            raise
+
+    def get_position(self, symbol):
+        self.rate_limiter.wait_if_needed()
+        try:
+            position = self.trading_client.get_open_position(symbol)
+            return position
+        except Exception:
+            return None
+
+    # ── Orders ─────────────────────────────────────────────────────────
+
+    def submit_market_order(self, symbol, qty, side, time_in_force="day"):
+        """Submit a market order with pre-validation."""
+        if qty < self.config.account.min_share_quantity:
+            self.log.error("ORDER", "Quantity below minimum",
+                           symbol=symbol, qty=qty)
+            return None
+
+        if self.config.account.account_type == AccountType.CASH and side == "sell":
+            pos = self.get_position(symbol)
+            if pos is None:
+                self.log.error("ORDER",
+                               "Cannot sell - no position (cash account)",
+                               symbol=symbol)
+                return None
+            if int(pos.qty) < qty:
+                self.log.error("ORDER", "Cannot sell more than held",
+                               symbol=symbol, held=pos.qty, requested=qty)
+                return None
+
+        self.rate_limiter.wait_if_needed()
+        try:
+            order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+            tif = TimeInForce.DAY if time_in_force == "day" else TimeInForce.GTC
+
+            request = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=tif
+            )
+
+            start = time.monotonic()
+            order = self.trading_client.submit_order(request)
+            latency_ms = (time.monotonic() - start) * 1000
+
+            self.log.log_order("SUBMITTED",
+                               order_id=str(order.id),
+                               symbol=symbol, side=side, qty=qty,
+                               type="market",
+                               latency_ms=round(latency_ms, 1))
+            return order
+
+        except Exception as e:
+            self.log.error("ORDER", f"Market order failed: {e}",
+                           symbol=symbol, side=side, qty=qty)
+            return None
+
+    def submit_limit_order(self, symbol, qty, side, limit_price,
+                           time_in_force="day"):
+        """Submit a limit order with pre-validation."""
+        if qty < self.config.account.min_share_quantity:
+            self.log.error("ORDER", "Quantity below minimum",
+                           symbol=symbol, qty=qty)
+            return None
+
+        if self.config.account.account_type == AccountType.CASH and side == "sell":
+            pos = self.get_position(symbol)
+            if pos is None:
+                self.log.error("ORDER",
+                               "Cannot sell - no position",
+                               symbol=symbol)
+                return None
+
+        self.rate_limiter.wait_if_needed()
+        try:
+            order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+            tif = TimeInForce.DAY if time_in_force == "day" else TimeInForce.GTC
+
+            request = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=tif,
+                limit_price=float(limit_price)
+            )
+
+            start = time.monotonic()
+            order = self.trading_client.submit_order(request)
+            latency_ms = (time.monotonic() - start) * 1000
+
+            self.log.log_order("SUBMITTED",
+                               order_id=str(order.id),
+                               symbol=symbol, side=side, qty=qty,
+                               type="limit",
+                               limit_price=str(limit_price),
+                               latency_ms=round(latency_ms, 1))
+            return order
+
+        except Exception as e:
+            self.log.error("ORDER", f"Limit order failed: {e}",
+                           symbol=symbol, side=side, qty=qty)
+            return None
+
+    def cancel_order(self, order_id):
+        self.rate_limiter.wait_if_needed()
+        try:
+            self.trading_client.cancel_order_by_id(order_id)
+            self.log.log_order("CANCEL_SENT", order_id=str(order_id))
+            return True
+        except Exception as e:
+            self.log.error("ORDER", f"Cancel failed: {e}",
+                           order_id=str(order_id))
+            return False
+
+    def cancel_all_orders(self):
+        self.rate_limiter.wait_if_needed()
+        try:
+            self.trading_client.cancel_orders()
+            self.log.log_order("CANCEL_ALL",
+                               reason="emergency_or_flatten")
+            return True
+        except Exception as e:
+            self.log.error("ORDER", f"Cancel all failed: {e}")
+            return False
+
+    def get_order(self, order_id):
+        self.rate_limiter.wait_if_needed()
+        try:
+            return self.trading_client.get_order_by_id(order_id)
+        except Exception as e:
+            self.log.error("ORDER", f"Get order failed: {e}",
+                           order_id=str(order_id))
+            return None
+
+    def get_open_orders(self):
+        self.rate_limiter.wait_if_needed()
+        try:
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN
+            )
+            return self.trading_client.get_orders(request)
+        except Exception as e:
+            self.log.error("ORDER", f"Get open orders failed: {e}")
+            return []
+
+    def close_position(self, symbol):
+        self.rate_limiter.wait_if_needed()
+        try:
+            self.trading_client.close_position(symbol)
+            self.log.log_order("CLOSE_POSITION", symbol=symbol)
+            return True
+        except Exception as e:
+            self.log.error("ORDER", f"Close position failed: {e}",
+                           symbol=symbol)
+            return False
+
+    def close_all_positions(self):
+        self.rate_limiter.wait_if_needed()
+        try:
+            self.trading_client.close_all_positions(cancel_orders=True)
+            self.log.log_order("CLOSE_ALL",
+                               reason="emergency_flatten")
+            return True
+        except Exception as e:
+            self.log.error("ORDER", f"Close all failed: {e}")
+            return False
+
+    
+    def get_closed_orders_since(self, after_dt: datetime):
+        """Return CLOSED orders since after_dt (for fill/settlement tracking)."""
+        self.rate_limiter.wait_if_needed()
+        try:
+            request = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                after=after_dt
+            )
+            orders = self.trading_client.get_orders(request)
+            return orders or []
+        except Exception as e:
+            self.log.error("ORDER", f"Get closed orders failed: {e}",
+                           after=str(after_dt))
+            return []
+
+# ── Market Data ────────────────────────────────────────────────────
+
+    def get_latest_quote(self, symbol):
+        """Get latest NBBO quote for a symbol."""
+        try:
+            request = StockLatestQuoteRequest(
+                symbol_or_symbols=symbol
+            )
+            quotes = self.data_client.get_stock_latest_quote(request)
+            if symbol in quotes:
+                return quotes[symbol]
+            return None
+        except Exception as e:
+            self.log.error("DATA", f"Quote fetch failed: {e}",
+                           symbol=symbol)
+            return None
+
+    def get_snapshot(self, symbol):
+        """Get full snapshot (quote + trade + bar) for a symbol."""
+        try:
+            request = StockSnapshotRequest(
+                symbol_or_symbols=symbol
+            )
+            snapshots = self.data_client.get_stock_snapshot(request)
+            if symbol in snapshots:
+                return snapshots[symbol]
+            return None
+        except Exception as e:
+            self.log.error("DATA", f"Snapshot fetch failed: {e}",
+                           symbol=symbol)
+            return None
+
+    def get_historical_bars(self, symbol, days=60,
+                            timeframe=TimeFrame.Minute):
+        """Get historical bars for indicator calculation."""
+        try:
+            start = datetime.now(timezone.utc) - timedelta(days=days)
+            request = StockBarsRequest(
+                symbol_or_symbols=[symbol],
+                timeframe=timeframe,
+                start=start
+            )
+            bars = self.data_client.get_stock_bars(request)
+
+            # alpaca-py returns a BarSet; try multiple access patterns
+            bar_list = None
+
+            # Pattern 1: .data dict
+            if hasattr(bars, 'data') and isinstance(bars.data, dict):
+                bar_list = bars.data.get(symbol)
+
+            # Pattern 2: direct dict access
+            if bar_list is None:
+                try:
+                    bar_list = bars[symbol]
+                except (KeyError, TypeError):
+                    pass
+
+            # Pattern 3: the object itself might be iterable
+            if bar_list is None and hasattr(bars, '__iter__'):
+                try:
+                    bar_list = list(bars)
+                except Exception:
+                    pass
+
+            if bar_list and len(bar_list) > 0:
+                return bar_list
+
+            self.log.warning("DATA", f"{symbol}: empty bar response")
+            return None
+        except Exception as e:
+            self.log.error("DATA", f"Historical bars failed: {e}",
+                           symbol=symbol)
+            return None
+
+    # ── Market Status ──────────────────────────────────────────────────
+
+    def is_market_open(self):
+        try:
+            clock = self.trading_client.get_clock()
+            return clock.is_open
+        except Exception as e:
+            self.log.error("BROKER", f"Clock check failed: {e}")
+            return False
+
+    def get_clock(self):
+        try:
+            return self.trading_client.get_clock()
+        except Exception as e:
+            self.log.error("BROKER", f"Clock fetch failed: {e}")
+            return None
+
+    # ── Reconciliation ─────────────────────────────────────────────────
+
+    def reconcile_positions(self, internal_positions):
+        """
+        Compare internal state against broker.
+        Returns (matched: bool, discrepancies: list).
+        We REFUSE to trade if reconciliation fails.
+        """
+        broker_positions = self.get_positions()
+        discrepancies = []
+
+        broker_map = {}
+        for pos in broker_positions:
+            broker_map[pos.symbol] = {
+                "qty": int(pos.qty),
+                "side": pos.side,
+                "avg_entry": Decimal(str(pos.avg_entry_price)),
+                "market_value": Decimal(str(pos.market_value)),
+                "unrealized_pl": Decimal(str(pos.unrealized_pl))
+            }
+
+        for symbol, internal in internal_positions.items():
+            if symbol not in broker_map:
+                discrepancies.append({
+                    "type": "MISSING_AT_BROKER",
+                    "symbol": symbol,
+                    "internal_qty": internal.get("qty", 0)
+                })
+            else:
+                broker = broker_map[symbol]
+                if internal.get("qty", 0) != broker["qty"]:
+                    discrepancies.append({
+                        "type": "QTY_MISMATCH",
+                        "symbol": symbol,
+                        "internal_qty": internal.get("qty", 0),
+                        "broker_qty": broker["qty"]
+                    })
+
+        for symbol in broker_map:
+            if symbol not in internal_positions:
+                discrepancies.append({
+                    "type": "UNKNOWN_POSITION",
+                    "symbol": symbol,
+                    "broker_qty": broker_map[symbol]["qty"]
+                })
+
+        matched = len(discrepancies) == 0
+        self.log.log_reconciliation(
+            matched,
+            internal_count=len(internal_positions),
+            broker_count=len(broker_positions),
+            discrepancies=discrepancies if discrepancies else "none"
+        )
+
+        return matched, discrepancies
